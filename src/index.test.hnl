@@ -1,9 +1,10 @@
 --- http-route.test -- coverage for the routing layer (`src/index.hnl`).
 ---
---- Exercises match_path (literals, :params, wildcards), query parsing
---- (repeats, percent/plus decoding), route/router dispatch (method
---- matching, first-match-wins, params + query_params injection, 404 and
---- fallback), and json_body.
+--- Exercises match_path (literals, :params, `*`/`*name` wildcards),
+--- query parsing (repeats, percent/plus decoding), route/router dispatch
+--- (method matching, specificity ranking, params + query_params
+--- injection, 404/405/fallback), named route maps + href + form (v2),
+--- and json_body.
 
 from "./index" import * as rt
 
@@ -40,6 +41,12 @@ req_get := { method: "GET", path: "/users/42", query: "q=hi",
 
 req_health := { method: "GET", path: "/health", query: "",
                 version: "HTTP/1.1", headers: {}, body: "", body_bytes: null }
+
+--- v2 helper: minimal request record.
+mkreq := (m, p) ~> do {
+  { method: m, path: p, query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }
+}
 
 -- ---------------------------------------------------------------------
 -- match_path: literals and :params
@@ -125,9 +132,8 @@ test_route_exact := assert rt.route(routes, req_health) =
   { status: 200, body: "ok GET" }
 
 test_route_method_mismatch := assert rt.route(routes,
-  { method: "POST", path: "/users/42", query: "", version: "HTTP/1.1",
-    headers: {}, body: "", body_bytes: null }) =
-  { status: 404, body: "not found" }
+  mkreq("POST", "/users/42")) =
+  { status: 405, headers: { allow: "GET" }, body: "method not allowed" }
 
 test_route_unknown_path := assert rt.route(routes,
   { method: "GET", path: "/nope", query: "", version: "HTTP/1.1",
@@ -199,3 +205,223 @@ test_jb_empty := assert rt.json_body(
     headers: {}, body: "", body_bytes: null }) = null
 
 test_jb_scalar := assert rt.json_body({ body: "42" }) = 42
+
+-- ---------------------------------------------------------------------
+-- match_path: *name wildcard captures
+-- ---------------------------------------------------------------------
+
+test_mp_starname := assert rt.match_path("/files/*rest", "/files/a/b") =
+  { rest: "a/b" }
+
+test_mp_starname_empty := assert rt.match_path("/files/*rest", "/files/") =
+  { rest: "" }
+
+test_mp_starname_alone := assert rt.match_path("*all", "/x/y") =
+  { all: "/x/y" }
+
+test_mp_starname_not_last := assert rt.match_path("/a/*r/b", "/a/1/b") = null
+
+test_mp_starname_miss := assert rt.match_path("/files/*r", "/other/a") = null
+
+-- ---------------------------------------------------------------------
+-- v2 fixtures: named route maps
+-- ---------------------------------------------------------------------
+
+get_h := (_r) ~> do { { status: 200, body: "GET" } }
+post_h := (_r) ~> do { { status: 200, body: "POST" } }
+put_h := (_r) ~> do { { status: 200, body: "PUT" } }
+new_h := (_r) ~> do { { status: 200, body: "new" } }
+id_h := (_r) ~> do { { status: 200, body: "id" } }
+rest_h := (r) ~> do { { status: 200, body: "rest=" + r.params.rest } }
+uid_h := (r) ~> do { { status: 200, body: "uid=" + r.params.id } }
+
+app_map := rt.route({
+  ".": any_h,
+  health: health_h,
+  users: { ":id": uid_h },
+  files: { "*rest": rest_h }
+})
+
+-- ---------------------------------------------------------------------
+-- route/1: named route maps
+-- ---------------------------------------------------------------------
+
+test_rm_empty := assert rt.route({}).entries = []
+
+test_rm_arrow_leaf := assert rt.router(app_map)(mkreq("GET", "/health")) =
+  { status: 200, body: "ok GET" }
+
+test_rm_nested := assert rt.router(app_map)(mkreq("GET", "/users/7")) =
+  { status: 200, body: "uid=7" }
+
+test_rm_index := assert rt.router(app_map)(mkreq("DELETE", "/")) =
+  { status: 200, body: "any" }
+
+test_rm_wildcard_capture := assert rt.router(app_map)(
+  mkreq("GET", "/files/css/site.css")) =
+  { status: 200, body: "rest=css/site.css" }
+
+test_rm_method_map := assert rt.router(rt.route({
+  ping: { get: get_h, post: post_h } }))(mkreq("POST", "/ping")) =
+  { status: 200, body: "POST" }
+
+test_rm_method_map_get := assert rt.router(rt.route({
+  ping: { get: get_h, post: post_h } }))(mkreq("GET", "/ping")) =
+  { status: 200, body: "GET" }
+
+test_rm_method_map_405 := assert rt.router(rt.route({
+  ping: { get: get_h, post: post_h } }))(mkreq("DELETE", "/ping")) =
+  { status: 405, headers: { allow: "GET, POST" },
+    body: "method not allowed" }
+
+test_rm_spec_leaf := assert rt.router(rt.route({
+  s: { method: "PUT", path: "explicit", handler: put_h } }))(
+  mkreq("PUT", "/explicit")) = { status: 200, body: "PUT" }
+
+test_rm_methods_list := assert rt.router(rt.route({
+  m: { methods: ["get", "post"], handler: get_h } }))(mkreq("POST", "/m")) =
+  { status: 200, body: "GET" }
+
+test_rm_top_method_map := assert rt.router(rt.route({
+  get: get_h, post: post_h }))(mkreq("POST", "/")) =
+  { status: 200, body: "POST" }
+
+test_rm_by_name_path := assert app_map.by_name.health.path = "/health"
+
+test_rm_raw_map_to_router := assert rt.router({
+  x: get_h })(mkreq("GET", "/x")) = { status: 200, body: "GET" }
+
+-- ---------------------------------------------------------------------
+-- href: reverse URL generation
+-- ---------------------------------------------------------------------
+
+test_href_param := assert rt.href("/users/:id", { id: "42" }) =
+  "/users/42"
+
+test_href_two_params := assert rt.href("/u/:a/b/:c", { a: "1", c: "2" }) =
+  "/u/1/b/2"
+
+test_href_starname := assert rt.href("/files/*p", { p: "a/b" }) =
+  "/files/a/b"
+
+test_href_star_bare := assert rt.href("/files/*", { "*": "a/b" }) =
+  "/files/a/b"
+
+test_href_literal := assert rt.href("/health", {}) = "/health"
+
+test_href_extra_params := assert rt.href("/a", { x: 1 }) = "/a"
+
+test_href_entry := assert rt.href(app_map.by_name.health, {}) =
+  "/health"
+
+test_href_named := assert rt.href(app_map, "users/:id", { id: "9" }) =
+  "/users/9"
+
+test_href_named_lookup2 := assert rt.href(app_map, "files/*rest",
+  { rest: "x" }) = "/files/x"
+
+test_href_missing_param := assert match error.try(
+  (x) ~> rt.href("/u/:id", {})) {
+  err(e): true, _: false }
+
+test_href_unknown_name := assert match error.try(
+  (x) ~> rt.href(app_map, "nope", {})) {
+  err(e): true, _: false }
+
+-- ---------------------------------------------------------------------
+-- specificity ranking
+-- ---------------------------------------------------------------------
+
+spec_routes := [
+  { path: "/u/:id", handler: id_h },
+  { path: "/u/new", handler: new_h }
+]
+
+test_spec_static_beats_param := assert rt.route(spec_routes,
+  mkreq("GET", "/u/new")) = { status: 200, body: "new" }
+
+test_spec_static_beats_param_rev := assert rt.route([...spec_routes],
+  mkreq("GET", "/u/new")) = { status: 200, body: "new" }
+
+test_spec_param_still_matches := assert rt.route(spec_routes,
+  mkreq("GET", "/u/42")) = { status: 200, body: "id" }
+
+spec_rev := [
+  { path: "/u/new", handler: new_h },
+  { path: "/u/:id", handler: id_h }
+]
+
+test_spec_order_independent := assert rt.route(spec_rev,
+  mkreq("GET", "/u/new")) = { status: 200, body: "new" }
+
+star_vs_param := [
+  { path: "/files/*", handler: star_h },
+  { path: "/files/:name", handler: id_h }
+]
+
+test_spec_param_beats_star := assert rt.route(star_vs_param,
+  mkreq("GET", "/files/a")) = { status: 200, body: "id" }
+
+exact_vs_star_tail := [
+  { path: "/a/b/*", handler: star_h },
+  { path: "/a/b", handler: new_h }
+]
+
+test_spec_exact_beats_star_tail := assert rt.route(exact_vs_star_tail,
+  mkreq("GET", "/a/b")) = { status: 200, body: "new" }
+
+test_spec_star_tail_still_matches := assert rt.route(exact_vs_star_tail,
+  mkreq("GET", "/a/b/c")) = { status: 200, body: "star /a/b/c" }
+
+-- ---------------------------------------------------------------------
+-- 405 Method Not Allowed
+-- ---------------------------------------------------------------------
+
+allow_routes := [
+  { method: "GET", path: "/a", handler: get_h },
+  { method: "POST", path: "/a", handler: post_h }
+]
+
+test_405_multi := assert rt.route(allow_routes, mkreq("PUT", "/a")) =
+  { status: 405, headers: { allow: "GET, POST" },
+    body: "method not allowed" }
+
+test_405_dedup := assert rt.route([
+  { method: "GET", path: "/a", handler: get_h },
+  { method: "POST", path: "/a", handler: post_h },
+  { method: "GET", path: "/a", handler: id_h }],
+  mkreq("PUT", "/a")) =
+  { status: 405, headers: { allow: "GET, POST" },
+    body: "method not allowed" }
+
+test_405_param_path := assert rt.route(allow_routes, mkreq("GET", "/a")) =
+  { status: 200, body: "GET" }
+
+test_404_still := assert rt.route(allow_routes, mkreq("GET", "/b")) =
+  { status: 404, body: "not found" }
+
+-- ---------------------------------------------------------------------
+-- wildcard capture through dispatch
+-- ---------------------------------------------------------------------
+
+test_dispatch_starname := assert rt.route([
+  { path: "/files/*rest", handler: rest_h }],
+  mkreq("GET", "/files/x/y")) = { status: 200, body: "rest=x/y" }
+
+-- ---------------------------------------------------------------------
+-- form: GET+POST at one URL (remix convention)
+-- ---------------------------------------------------------------------
+
+login_map := rt.route({
+  login: rt.form("/login")({ get: get_h, post: post_h })
+})
+
+test_form_get := assert rt.router(login_map)(mkreq("GET", "/login")) =
+  { status: 200, body: "GET" }
+
+test_form_post := assert rt.router(login_map)(mkreq("POST", "/login")) =
+  { status: 200, body: "POST" }
+
+test_form_direct := assert rt.router(rt.route({
+  f: rt.form("/f", { get: get_h, post: post_h })
+}))(mkreq("POST", "/f")) = { status: 200, body: "POST" }

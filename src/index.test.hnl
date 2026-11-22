@@ -1,0 +1,201 @@
+--- http-route.test -- coverage for the routing layer (`src/index.hnl`).
+---
+--- Exercises match_path (literals, :params, wildcards), query parsing
+--- (repeats, percent/plus decoding), route/router dispatch (method
+--- matching, first-match-wins, params + query_params injection, 404 and
+--- fallback), and json_body.
+
+from "./index" import * as rt
+
+-- ---------------------------------------------------------------------
+-- fixtures
+-- ---------------------------------------------------------------------
+
+health_h := (req) ~> do {
+  { status: 200, body: "ok " + req.method }
+}
+
+user_h := (req) ~> do {
+  { status: 200,
+    body: "user " + req.params.id + " q=" + req.query_params.q }
+}
+
+any_h := (_req) ~> do {
+  { status: 200, body: "any" }
+}
+
+star_h := (req) ~> do {
+  { status: 200, body: "star " + req.path }
+}
+
+routes := [
+  { method: "GET", path: "/health", handler: health_h },
+  { method: "GET", path: "/users/:id", handler: user_h },
+  { path: "/any", handler: any_h },
+  { method: "*", path: "/files/*", handler: star_h }
+]
+
+req_get := { method: "GET", path: "/users/42", query: "q=hi",
+             version: "HTTP/1.1", headers: {}, body: "", body_bytes: null }
+
+req_health := { method: "GET", path: "/health", query: "",
+                version: "HTTP/1.1", headers: {}, body: "", body_bytes: null }
+
+-- ---------------------------------------------------------------------
+-- match_path: literals and :params
+-- ---------------------------------------------------------------------
+
+test_mp_literal := assert rt.match_path("/health", "/health") = {}
+
+test_mp_param := assert rt.match_path("/users/:id", "/users/42") = { id: "42" }
+
+test_mp_two_params := assert rt.match_path("/u/:a/b/:c", "/u/1/b/2") =
+  { a: "1", c: "2" }
+
+test_mp_param_empty := assert rt.match_path("/u/:id", "/u/") = { id: "" }
+
+test_mp_literal_mismatch := assert rt.match_path("/health", "/healthz") = null
+
+test_mp_param_no_slash_cross := assert rt.match_path("/u/:id", "/u/a/b") = null
+
+test_mp_too_few := assert rt.match_path("/a/b", "/a") = null
+
+test_mp_too_many := assert rt.match_path("/a/b", "/a/b/c") = null
+
+test_mp_root := assert rt.match_path("/", "/") = {}
+
+test_mp_case_sensitive := assert rt.match_path("/Health", "/health") = null
+
+-- ---------------------------------------------------------------------
+-- match_path: wildcards
+-- ---------------------------------------------------------------------
+
+test_mp_star_all := assert rt.match_path("*", "/x/y/z") = {}
+
+test_mp_star_tail := assert rt.match_path("/files/*", "/files/a/b/c") = {}
+
+test_mp_star_tail_empty := assert rt.match_path("/files/*", "/files/") = {}
+
+test_mp_star_prefix_miss := assert rt.match_path("/files/*", "/other/a") = null
+
+test_mp_star_not_last := assert rt.match_path("/*/x", "/a/x") = null
+
+test_mp_star_mid_pattern := assert rt.match_path("/a/*/b", "/a/1/2/b") = null
+
+-- ---------------------------------------------------------------------
+-- query
+-- ---------------------------------------------------------------------
+
+test_q_empty := assert rt.query("") = {}
+
+test_q_basic := assert rt.query("a=1&b=2") = { a: "1", b: "2" }
+
+test_q_bare_flag := assert rt.query("flag") = { flag: "" }
+
+test_q_bare_mixed := assert rt.query("a=1&flag&b=2") =
+  { a: "1", flag: "", b: "2" }
+
+test_q_repeat := assert rt.query("a=1&a=2") = { a: ["1", "2"] }
+
+test_q_repeat_three := assert rt.query("a=1&a=2&a=3") =
+  { a: ["1", "2", "3"] }
+
+test_q_eq_in_value := assert rt.query("a=b=c") = { a: "b=c" }
+
+test_q_pct := assert rt.query("q=a%20b") = { q: "a b" }
+
+test_q_plus := assert rt.query("q=a+b") = { q: "a b" }
+
+test_q_pct_bad := assert rt.query("a=%zz") = { a: "%zz" }
+
+test_q_pct_trunc := assert rt.query("a=%4") = { a: "%4" }
+
+test_q_key_pct := assert rt.query("a%20b=1") = { "a b": "1" }
+
+test_q_empty_seg := assert rt.query("a=1&&b=2") = { a: "1", b: "2" }
+
+-- ---------------------------------------------------------------------
+-- route / router dispatch
+-- ---------------------------------------------------------------------
+
+test_route_param := assert rt.route(routes, req_get) =
+  { status: 200, body: "user 42 q=hi" }
+
+test_route_exact := assert rt.route(routes, req_health) =
+  { status: 200, body: "ok GET" }
+
+test_route_method_mismatch := assert rt.route(routes,
+  { method: "POST", path: "/users/42", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) =
+  { status: 404, body: "not found" }
+
+test_route_unknown_path := assert rt.route(routes,
+  { method: "GET", path: "/nope", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) =
+  { status: 404, body: "not found" }
+
+test_route_empty_routes := assert rt.route([], req_get) =
+  { status: 404, body: "not found" }
+
+test_route_star_method := assert rt.route(routes,
+  { method: "DELETE", path: "/any", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) =
+  { status: 200, body: "any" }
+
+test_route_wildcard := assert rt.route(routes,
+  { method: "GET", path: "/files/css/site.css", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) =
+  { status: 200, body: "star /files/css/site.css" }
+
+test_route_first_wins := assert rt.route(
+  [{ path: "/dup", handler: (_r) ~> do { { status: 1, body: "first" } } },
+   { path: "/dup", handler: (_r) ~> do { { status: 2, body: "second" } } }],
+  { method: "GET", path: "/dup", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) =
+  { status: 1, body: "first" }
+
+test_route_params_empty_record := assert rt.route(
+  [{ path: "/x", handler: (r) ~> do { { status: 200,
+      body: type.to_string(r.params) + "|" + type.to_string(r.query_params) } } }],
+  { method: "GET", path: "/x", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) =
+  { status: 200, body: "{}|{}" }
+
+test_route_catchall_fallback := assert rt.route([...routes,
+  { method: "*", path: "*",
+    handler: (r) ~> do { { status: 418, body: "teapot " + r.path } } }],
+  { method: "GET", path: "/nope", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) =
+  { status: 418, body: "teapot /nope" }
+
+test_route_catchall_method := assert rt.route([...routes,
+  { method: "*", path: "*",
+    handler: (r) ~> do { { status: 418, body: "teapot " + r.method } } }],
+  { method: "POST", path: "/nope", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) =
+  { status: 418, body: "teapot POST" }
+
+test_router := assert rt.router(routes)(req_get) =
+  { status: 200, body: "user 42 q=hi" }
+
+test_router_miss := assert rt.router([...routes,
+  { method: "*", path: "*",
+    handler: (r) ~> do { { status: 404, body: "custom " + r.method } } }])(
+  { method: "POST", path: "/nope", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) =
+  { status: 404, body: "custom POST" }
+
+-- ---------------------------------------------------------------------
+-- json_body
+-- ---------------------------------------------------------------------
+
+test_jb_object := assert rt.json_body(
+  { method: "POST", path: "/x", query: "", version: "HTTP/1.1",
+    headers: {}, body: "{\"a\":1,\"b\":[2]}", body_bytes: null }) =
+  { a: 1, b: [2] }
+
+test_jb_empty := assert rt.json_body(
+  { method: "GET", path: "/x", query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }) = null
+
+test_jb_scalar := assert rt.json_body({ body: "42" }) = 42

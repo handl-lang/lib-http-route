@@ -1,0 +1,258 @@
+--- http-route -- pure routing layer between `serve` (lib-serve /
+--- serve-epoll) and Handl handler arrows.
+---
+--- `serve` hands the handler a parsed request record
+--- `{ method, target, path, query, version, headers, body, body_bytes }`
+--- (lib-http-rfc shape) and expects a response record back. This module
+--- is the dispatch half: given a list of route entries it picks the first
+--- whose method and path pattern match, binds `:param` segments and the
+--- parsed query string onto the request, and calls the handler.
+---
+--- Route entry:
+---   { method?: String | "*",   -- absent or "*" matches any method
+---     path:   String,          -- "/users/:id", "/files/*", "*"
+---     handler: (req) ~> resp } -- plain arrow, same shape as serve's
+---
+--- Path patterns are segment-wise (`str.split` on "/"):
+---   - literal segments must match exactly;
+---   - `:name` binds one segment into `req.params.name` (string, may be
+---     empty for a trailing slash);
+---   - `*` as the LAST segment matches any remaining segments and binds
+---     nothing; `*` anywhere else makes the pattern never match;
+---   - segment counts must agree otherwise ("/a/b" does not match "/a"
+---     or "/a/b/c"); matching is case-sensitive and "/"-exact, so
+---     "/users/" and "/users" are different paths.
+---
+--- On a match the handler receives `req` merged with:
+---   params        -- record of `:name` bindings ({} when none)
+---   query_params  -- record parsed from `req.query` by `query/1`
+---
+--- On no match `route/2` returns `not_found` ({ status: 404, ... }).
+--- Method mismatches are 404s, not 405s -- routing is first-match-wins
+--- over the list order, so a custom fallback is just a trailing
+--- `{ method: "*", path: "*" }` entry.
+---
+--- Exports:
+---   match_path(pattern, path)  ~> params record | null
+---   query(qs)                  ~> query-string -> record
+---   json_body(req)             ~> parsed JSON body | null
+---   not_found                  -- the default 404 response record
+---   route(routes, req)         ~> resp record
+---   router(routes)             ~> (req) ~> resp   -- serve-ready
+
+from "str" import * as str
+from "char" import * as char
+from "typeof" import * as typeof
+from "json" import * as json
+
+-- ---------------------------------------------------------------------
+-- list / record helpers
+-- ---------------------------------------------------------------------
+
+alen := (xs) ~> while { xs: xs, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [_h, ...t]: { state: { xs: t, n: n + 1 } }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- path patterns
+-- ---------------------------------------------------------------------
+
+--- segment-wise match of `pattern` against `path`. Returns the params
+--- record on match, null on mismatch. `*` must be the last pattern
+--- segment; it consumes the rest of the path and binds nothing.
+match_segs := (ps, ss, params) ~> while { ps: ps, ss: ss, params: params } {
+  (ps, ss, params) ~> match ps {
+    []: { out: if alen(ss) == 0 { params } else { null } },
+    [p, ...pt]: if p == "*" {
+      { out: if alen(pt) == 0 { params } else { null } }
+    } else {
+      match ss {
+        []: { out: null },
+        [s, ...st]: if str.starts_with(p, ":") {
+          { state: { ps: pt, ss: st,
+            params: hash_map.set(params,
+              str.slice(p, 1, str.length(p)), s) } }
+        } else {
+          if p == s {
+            { state: { ps: pt, ss: st, params: params } }
+          } else {
+            { out: null }
+          }
+        }
+      }
+    }
+  }
+}
+
+export match_path := (pattern, path) ~> do {
+  match_segs(str.split(pattern, "/"), str.split(path, "/"), {})
+}
+
+-- ---------------------------------------------------------------------
+-- query strings
+-- ---------------------------------------------------------------------
+
+--- hex digit value, -1 when not a hex char (mirrors http_rfc).
+hexval := (c) ~> do {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else {
+    if c >= 65 && c <= 70 {
+      c - 55
+    } else {
+      if c >= 97 && c <= 102 {
+        c - 87
+      } else {
+        -1
+      }
+    }
+  }
+}
+
+--- percent-decode `s`: `%XX` -> byte as a char, `+` -> space, invalid
+--- `%` sequences pass through literally.
+pct_decode := (s) ~> while { i: 0, n: str.length(s), acc: "" } {
+  (i, n, acc) ~> if i >= n {
+    { out: acc }
+  } else {
+    do {
+      c := str.char_at(s, i)
+      if c == "%" && i + 2 < n {
+        do {
+          h1 := hexval(char.code_point_at(s, i + 1))
+          h2 := hexval(char.code_point_at(s, i + 2))
+          if h1 >= 0 && h2 >= 0 {
+            { state: { i: i + 3, n: n,
+              acc: acc + char.from_code_point(h1 * 16 + h2) } }
+          } else {
+            { state: { i: i + 1, n: n, acc: acc + c } }
+          }
+        }
+      } else {
+        { state: { i: i + 1, n: n,
+          acc: acc + if c == "+" { " " } else { c } } }
+      }
+    }
+  }
+}
+
+--- insert `v` under `k`: repeated keys accumulate into a list
+--- ("a=1&a=2" -> { a: ["1", "2"] }).
+qput := (acc, k, v) ~> do {
+  if hash_map.has(acc, k) {
+    do {
+      old := hash_map.get_or(acc, k, null)
+      nv := if typeof.is(old, typeof.arr()) {
+        [...old, v]
+      } else {
+        [old, v]
+      }
+      hash_map.set(acc, k, nv)
+    }
+  } else {
+    hash_map.set(acc, k, v)
+  }
+}
+
+--- parse `qs` (the part after `?`, no leading `?`) into a record of
+--- string values. Bare `flag` segments get `""`; `a=b=c` keeps `b=c`.
+export query := (qs) ~> do {
+  segs := str.split(qs, "&")
+  while { xs: segs, acc: {} } {
+    (xs, acc) ~> match xs {
+      []: { out: acc },
+      [s, ...t]: if str.is_empty(s) {
+        { state: { xs: t, acc: acc } }
+      } else {
+        do {
+          i := str.find(s, "=")
+          if i < 0 {
+            { state: { xs: t, acc: qput(acc, pct_decode(s), "") } }
+          } else {
+            { state: { xs: t, acc: qput(acc,
+              pct_decode(str.slice(s, 0, i)),
+              pct_decode(str.slice(s, i + 1, str.length(s)))) } }
+          }
+        }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- dispatch
+-- ---------------------------------------------------------------------
+
+--- route method check: absent or "*" matches anything, else exact
+--- (case-sensitive -- HTTP methods are uppercase by convention).
+method_ok := (r, m) ~> do {
+  rm := hash_map.get_or(r, "method", "*")
+  rm == "*" || rm == m
+}
+
+--- first route entry whose method+path match, as { route, params },
+--- or null.
+find := (routes, req) ~> while { xs: routes, out: null } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [r, ...t]: if out != null {
+      { out: out }
+    } else {
+      do {
+        m := hash_map.get_or(req, "method", "")
+        p := hash_map.get_or(req, "path", "")
+        pat := hash_map.get_or(r, "path", null)
+        if pat == null || method_ok(r, m) == false {
+          { state: { xs: t, out: null } }
+        } else {
+          do {
+            prm := match_path(pat, p)
+            if prm == null {
+              { state: { xs: t, out: null } }
+            } else {
+              { out: { route: r, params: prm } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- the default miss response (plain text, like serve-epoll's 400s).
+export not_found := { status: 404, body: "not found" }
+
+--- dispatch `req` through `routes`; the first method+path match wins.
+export route := (routes, req) ~> do {
+  hit := find(routes, req)
+  if hit == null {
+    not_found
+  } else {
+    do {
+      h := hash_map.get_or(hit.route, "handler", null)
+      req2 := hash_map.merge(req, {
+        params: hit.params,
+        query_params: query(hash_map.get_or(req, "query", ""))
+      })
+      h(req2)
+    }
+  }
+}
+
+--- serve-ready handler: `serve(router(routes), { port })`.
+export router := (routes) ~> (req) ~> route(routes, req)
+
+--- parse `req.body` as JSON; null when the body is absent/empty.
+--- Malformed JSON propagates json.parse's error -- check the
+--- content-type header (or use this only on routes that expect JSON).
+export json_body := (req) ~> do {
+  b := hash_map.get_or(req, "body", "")
+  if typeof.is(b, typeof.str()) && str.is_empty(b) == false {
+    json.parse(b)
+  } else {
+    null
+  }
+}

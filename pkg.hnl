@@ -1,3 +1,3 @@
--- lib-http-route: modules this package provides (entry defaults to
+-- lib-http-router: modules this package provides (entry defaults to
 -- src/index.hnl; N modules resolve to src/<name>/index.hnl).
-{ modules: ["http-route"], deps: { json: "branch:main" }, name: "http-route", description: "Pure-handl routing layer between serve and handler arrows: named route maps, method+path patterns, :params, *name wildcards, specificity ranking, 405s, href generation, query parsing, JSON body decode.", license: "MIT", keywords: ["http", "router", "routing", "serve", "stdlib", "handl"], homepage: "https://github.com/handl-lang/lib-http-route" }
+{ modules: ["http-router"], deps: { json: "branch:main", route: "branch:main" }, name: "http-router", description: "HTTP routing layer over lib-route: named route maps, method+path dispatch with :params/*wildcards/optional groups, 405s, href generation, query parsing, JSON body decode.", license: "MIT", keywords: ["http", "router", "routing", "serve", "stdlib", "handl"], homepage: "https://github.com/handl-lang/lib-http-router" }

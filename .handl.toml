@@ -1,0 +1,5 @@
+[dependencies]
+route = { path = "../lib-route/src" }
+
+# own package
+http-router = { path = "src" }

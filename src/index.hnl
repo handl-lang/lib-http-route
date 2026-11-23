@@ -1,67 +1,48 @@
---- http-route -- pure routing layer between `serve` (lib-serve /
---- serve-epoll) and Handl handler arrows.
+--- http-router -- pure routing layer between `serve` (lib-serve /
+--- serve-epoll) and Handl handler arrows, built on `lib-route` (the
+--- generic route-pattern library: `compile`/`dispatch`/`match_path`/
+--- `compile_pat`).
 ---
 --- `serve` hands the handler a parsed request record
 --- `{ method, target, path, query, version, headers, body, body_bytes }`
 --- (lib-http-rfc shape) and expects a response record back
 --- `{ status?, headers?, body? | body_bytes? }`. This module is the
---- dispatch half: given route entries it picks the most *specific*
---- method+path match, binds `:param` segments, `*name` wildcard
---- remainders and the parsed query string onto the request, and calls
---- the handler.
+--- HTTP shell: given route entries it normalizes them (legacy lists and
+--- v2 named route maps), compiles them into a `route` trie once, and
+--- per request parses the query string, dispatches on method+path, and
+--- calls the handler.
 ---
 --- Route entries (legacy list form, still supported):
 ---   { method?: String | "*",   -- absent or "*" matches any method
 ---     path:   String,          -- "/users/:id", "/files/*rest", "*"
 ---     handler: (req) ~> resp } -- plain arrow, same shape as serve's
 ---
---- Path patterns are segment-wise (`str.split` on "/"):
+--- Path patterns are segment-wise (`str.split` on "/") -- the full
+--- grammar (literals, `:param`, `*`/` *name` splats, v3 optional groups
+--- `(/seg)`, suffix/prefix vars `:file.:ext`, `?k=v` search
+--- constraints) is implemented by lib-route; see its docs. In short:
 ---   - literal segments must match exactly;
 ---   - `:name` binds one segment into `req.params.name` (string, may be
 ---     empty for a trailing slash);
 ---   - `*` or `*name` as the LAST segment matches any remaining
 ---     segments; `*name` binds the remainder ("/"-joined) to
----     `req.params.name`, bare `*` binds nothing; a `*`/` *name`
----     segment anywhere else makes the pattern never match;
----   - segment counts must agree otherwise ("/a/b" does not match "/a"
----     or "/a/b/c"); matching is case-sensitive and "/"-exact, so
----     "/users/" and "/users" are different paths.
----
---- v3 pattern grammar (compiled once per route at `router()` build;
---- patterns without the new productions keep the v2 matcher):
----   - `(/seg)` optional group, e.g. `/files(/:name)` matches "/files"
----     and "/files/x"; groups may nest `(/a(/b))` up to depth 4 and a
----     pattern may hold at most 8 groups total (compile error beyond);
----   - suffix/prefix vars inside a segment: `:file.:ext` binds
----     `{file, ext}` (greedy: the param takes up to the LAST literal
----     anchor), `v:version` binds `version` after literal "v"; param
----     names are `[A-Za-z0-9_-]` and adjacent params need a literal
----     separator;
----   - `?foo=bar&baz` search constraints on the pattern (or a
----     `constraints` record on a spec/method-map leaf): the route only
----     matches when the request's parsed query satisfies every
----     `key=value` pair (bare `key` requires presence). Constraints
----     are part of path-match eligibility: a constraint miss is a 404,
----     not a 405.
----   - `(` only opens a group when followed by `/` or `)`, `)` only
----     closes an open group, `*` is a splat only at a segment start --
----     otherwise they stay literal, so v1/v2 patterns keep working.
----   - malformed patterns (unbalanced parens, params without names,
----     groups not followed by `/` or end) raise at compile time.
+---     `req.params.name`, bare `*` binds nothing;
+---   - `(/seg)` optional groups, suffix vars and search constraints
+---     follow the v3 grammar (compiled once per route);
+---   - `?foo=bar` constraints make the route match only when the
+---     request's parsed query satisfies every `key=value` pair (bare
+---     `key` requires presence). Constraints are part of path-match
+---     eligibility: a constraint miss is a 404, not a 405.
 ---
 --- On a match the handler receives `req` merged with:
 ---   params        -- record of `:name`/`*name` bindings ({} when none)
 ---   query_params  -- record parsed from `req.query` by `query/1`
 ---
---- Dispatch is specificity-ranked, not first-match: among entries whose
---- path pattern matches, only method-compatible ones are eligible, and
---- the winner is the highest-scoring pattern (static segment = 2,
---- `:param` = 1, `*`/` *name` = 0, compared left-to-right; a pattern
---- that is a strict score-prefix of another wins -- an exact "/a/b"
---- beats "/a/b/*"). Equal scores keep list order. Path matches with no
---- method-compatible entry produce a 405 (`Allow` header = the
---- comma-joined methods of the path-matching entries); no path match
---- at all produces `not_found` ({ status: 404, ... }).
+--- Dispatch is specificity-ranked by lib-route's trie (static segment
+--- beats `:param` beats `*`/group; entry order breaks ties). Path
+--- matches with no method-compatible entry produce a 405 (`Allow`
+--- header = the comma-joined methods of the path-matching entries); no
+--- path match at all produces `not_found` ({ status: 404, ... }).
 ---
 --- Named route maps (v2, remix-inspired) -- `route/1` builds a
 --- route-map record `{ entries, by_name }` from a record
@@ -119,7 +100,7 @@
 --- `route({ photos: resources("photos", hs) })`.
 ---
 --- Exports:
----   match_path(pattern, path)  ~> params record | null
+---   match_path(pattern, path)  ~> params record | null   (lib-route)
 ---   query(qs)                  ~> query-string -> record
 ---   json_body(req)             ~> parsed JSON body | null
 ---   not_found                  -- the default 404 response record
@@ -136,6 +117,7 @@ from "str" import * as str
 from "char" import * as char
 from "typeof" import * as typeof
 from "json" import * as json
+from "route" import * as rt
 
 -- ---------------------------------------------------------------------
 -- list / record helpers
@@ -191,81 +173,6 @@ is_str    := (v) ~> type.of(v) == "string"
 is_arrow  := (v) ~> type.of(v) == "arrow"
 
 str_of := (v) ~> if is_str(v) { v } else { type.to_string(v) }
-
--- ---------------------------------------------------------------------
--- path patterns
--- ---------------------------------------------------------------------
-
---- segment-wise match of `pattern` against `path`. Returns the params
---- record on match, null on mismatch. A trailing `*`/`*name` segment
---- consumes the rest of the path; `*name` binds the "/"-joined remainder
---- to `name`, bare `*` binds nothing. `*` anywhere but last never matches.
-match_segs := (ps, ss, params) ~> while { ps: ps, ss: ss, params: params } {
-  (ps, ss, params) ~> match ps {
-    []: { out: if alen(ss) == 0 { params } else { null } },
-    [p, ...pt]: if str.starts_with(p, "*") {
-      if alen(pt) == 0 {
-        if p == "*" {
-          { out: params }
-        } else {
-          { out: hash_map.set(params,
-            str.slice(p, 1, str.length(p)), str.join(ss, "/")) }
-        }
-      } else {
-        { out: null }
-      }
-    } else {
-      match ss {
-        []: { out: null },
-        [s, ...st]: if str.starts_with(p, ":") {
-          { state: { ps: pt, ss: st,
-            params: hash_map.set(params,
-              str.slice(p, 1, str.length(p)), s) } }
-        } else {
-          if p == s {
-            { state: { ps: pt, ss: st, params: params } }
-          } else {
-            { out: null }
-          }
-        }
-      }
-    }
-  }
-}
-
--- (the v3 pattern compiler + `match_path` live after the query
--- section, since constraint parsing reuses `pct_decode`).
-
--- ---------------------------------------------------------------------
--- specificity scoring
--- ---------------------------------------------------------------------
-
---- per-segment score: literal 2 > `:param` 1 > `*`/` *name` 0.
-seg_score := (p) ~> if str.starts_with(p, "*") {
-  0
-} else {
-  if str.starts_with(p, ":") { 1 } else { 2 }
-}
-
-pat_score := (pattern) ~> lmap(seg_score, str.split(pattern, "/"))
-
---- true when score list `a` is strictly more specific than `b`:
---- lexicographic left-to-right, higher segment score wins; a strict
---- score-prefix wins (exact "/a/b" [2,2] beats "/a/b/*" [2,2,0]); fully
---- equal scores are a tie (dispatch keeps list order).
-score_better := (a, b) ~> while { xs: a, ys: b } {
-  (xs, ys) ~> match xs {
-    []: { out: alen(ys) > 0 },
-    [x, ...xt]: match ys {
-      []: { out: false },
-      [y, ...yt]: if x == y {
-        { state: { xs: xt, ys: yt } }
-      } else {
-        { out: x > y }
-      }
-    }
-  }
-}
 
 -- ---------------------------------------------------------------------
 -- query strings
@@ -359,511 +266,15 @@ export query := (qs) ~> do {
 }
 
 -- ---------------------------------------------------------------------
--- v3 pattern compiler: optional groups, suffix vars, search constraints
+-- path matching -- delegated to lib-route (`route.match_path`)
 -- ---------------------------------------------------------------------
 
-OPT_MAX_DEPTH  := 4
-OPT_MAX_GROUPS := 8
-
---- identifier chars for `:param`/`*name` names: ASCII alnum, '_' and '-'.
-is_nname := (c) ~> (c >= 48 && c <= 57) || (c >= 65 && c <= 90) ||
-  (c >= 97 && c <= 122) || c == 95 || c == 45
-
---- longest `[A-Za-z0-9_-]` run starting at index `i`; "" when none.
-scan_name := (s, i) ~> while { k: i, acc: "" } {
-  (k, acc) ~> if k < str.length(s) && is_nname(char.code_point_at(s, k)) {
-    { state: { k: k + 1, acc: acc + str.char_at(s, k) } }
-  } else {
-    { out: acc }
-  }
-}
-
-flushlit := (toks, lit) ~> if str.is_empty(lit) {
-  toks
-} else {
-  [...toks, { t: "lit", s: lit }]
-}
-
---- tokenize the path part of a pattern (the `?query` suffix is split
---- off before this runs). `(` opens an optional group only when
---- followed by '/' or ')' (otherwise literal); `)` closes a group only
---- while one is open (otherwise literal); `*` is a splat only at a
---- segment start (otherwise literal); `:` always opens a `:param`.
-tokenize := (s) ~> while { i: 0, n: str.length(s), toks: [],
-  lit: "", ss: true, depth: 0 } {
-  (i, n, toks, lit, ss, depth) ~> if i >= n {
-    { out: flushlit(toks, lit) }
-  } else {
-    do {
-      c := str.char_at(s, i)
-      nx := if i + 1 < n { str.char_at(s, i + 1) } else { "" }
-      if c == "/" {
-        { state: { i: i + 1, n: n,
-          toks: [...flushlit(toks, lit), { t: "slash" }],
-          lit: "", ss: true, depth: depth } }
-      } else {
-        if c == "(" && (nx == "/" || nx == ")") {
-          { state: { i: i + 1, n: n,
-            toks: [...flushlit(toks, lit), { t: "lp" }],
-            lit: "", ss: true, depth: depth + 1 } }
-        } else {
-          if c == ")" && depth > 0 {
-            { state: { i: i + 1, n: n,
-              toks: [...flushlit(toks, lit), { t: "rp" }],
-              lit: "", ss: false, depth: depth - 1 } }
-          } else {
-            if c == ":" {
-              do {
-                nm := scan_name(s, i + 1)
-                if str.is_empty(nm) {
-                  error.raise("http-route: empty param name in pattern '" +
-                    s + "'")
-                } else {
-                  { state: { i: i + 1 + str.length(nm), n: n,
-                    toks: [...flushlit(toks, lit),
-                      { t: "param", name: nm }],
-                    lit: "", ss: false, depth: depth } }
-                }
-              }
-            } else {
-              if c == "*" && ss {
-                do {
-                  nm := scan_name(s, i + 1)
-                  { state: { i: i + 1 + str.length(nm), n: n,
-                    toks: [...flushlit(toks, lit),
-                      { t: "star",
-                        name: if str.is_empty(nm) { null } else { nm } }],
-                    lit: "", ss: false, depth: depth } }
-                }
-              } else {
-                { state: { i: i + 1, n: n, toks: toks, lit: lit + c,
-                  ss: false, depth: depth } }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
---- append the pending segment to `items` when it has parts or a
---- trailing boundary (`bnd` = "after slash", i.e. a segment may be
---- legitimately empty).
-emit_seg := (items, parts, bnd) ~> if alen(parts) > 0 || bnd {
-  [...items, { k: "seg", parts: parts }]
-} else {
-  items
-}
-
---- recursive-descent parser over tokens; returns
---- `{ items, i, bad }` where `i` is the token index just past this
---- list (past the closing ')' for inner lists) and `bad` marks a
---- splat that is not the last item of its list (the pattern then
---- never matches, mirroring the v2 rule).
-parse_list := (self, toks, i0, inner, depth, src) ~> do {
-  while { i: i0, items: [], parts: [], bnd: inner == false,
-    bad: false } {
-    (i, items, parts, bnd, bad) ~> if bad {
-      { out: { items: [], i: i, bad: true } }
-    } else {
-      if i >= alen(toks) {
-        if inner {
-          error.raise("http-route: unbalanced '(' in pattern '" + src + "'")
-        } else {
-          { out: { items: emit_seg(items, parts, bnd), i: i,
-            bad: false } }
-        }
-      } else {
-        do {
-          tok := toks[i]
-          if tok.t == "slash" {
-            { state: { i: i + 1, items: emit_seg(items, parts, bnd),
-              parts: [], bnd: true, bad: false } }
-          } else {
-            if tok.t == "lit" {
-              { state: { i: i + 1, items: items,
-                parts: [...parts, { t: "lit", s: tok.s }],
-                bnd: false, bad: false } }
-            } else {
-              if tok.t == "param" {
-                do {
-                  lp := if alen(parts) == 0 {
-                    null
-                  } else {
-                    parts[alen(parts) - 1]
-                  }
-                  if lp != null && lp.t == "param" {
-                    error.raise("http-route: adjacent params need a " +
-                      "literal separator in '" + src + "'")
-                  } else {
-                    { state: { i: i + 1, items: items,
-                      parts: [...parts, { t: "param", name: tok.name }],
-                      bnd: false, bad: false } }
-                  }
-                }
-              } else {
-                if tok.t == "star" {
-                  do {
-                    nb := i + 1 < alen(toks) && toks[i + 1].t != "rp"
-                    { state: { i: i + 1,
-                      items: [...items, { k: "splat", name: tok.name }],
-                      parts: [], bnd: false, bad: nb } }
-                  }
-                } else {
-                  if tok.t == "lp" {
-                    do {
-                      if depth + 1 > OPT_MAX_DEPTH {
-                        error.raise("http-route: optional groups nested " +
-                          "too deep (max " +
-                          type.to_string(OPT_MAX_DEPTH) + ") in '" + src +
-                          "'")
-                      } else {
-                        do {
-                          it1 := emit_seg(items, parts, bnd)
-                          nxt := if i + 1 < alen(toks) {
-                            toks[i + 1]
-                          } else {
-                            null
-                          }
-                          if nxt == null ||
-                             (nxt.t != "slash" && nxt.t != "rp") {
-                            error.raise("http-route: optional group must " +
-                              "start with '/' in '" + src + "'")
-                          } else {
-                            if nxt.t == "rp" {
-                              { state: { i: i + 2, items: it1, parts: [],
-                                bnd: false, bad: false } }
-                            } else {
-                              do {
-                                g := self(self, toks, i + 2, true,
-                                  depth + 1, src)
-                                if g.bad {
-                                  { state: { i: g.i, items: [], parts: [],
-                                    bnd: false, bad: true } }
-                                } else {
-                                  do {
-                                    git := if alen(g.items) == 0 {
-                                      it1
-                                    } else {
-                                      [...it1,
-                                        { k: "group", items: g.items }]
-                                    }
-                                    if g.i < alen(toks) {
-                                      nt := toks[g.i]
-                                      if nt.t != "slash" &&
-                                         nt.t != "rp" &&
-                                         nt.t != "lp" {
-                                        error.raise("http-route: " +
-                                          "optional group must be " +
-                                          "followed by '/' or end in '" +
-                                          src + "'")
-                                      } else {
-                                        { state: { i: g.i, items: git,
-                                          parts: [], bnd: false,
-                                          bad: false } }
-                                      }
-                                    } else {
-                                      { state: { i: g.i, items: git,
-                                        parts: [], bnd: false,
-                                        bad: false } }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  } else {
-                    -- tok.t == "rp"
-                    if inner {
-                      { out: { items: emit_seg(items, parts, bnd),
-                        i: i + 1, bad: false } }
-                    } else {
-                      error.raise("http-route: unbalanced ')' in pattern '" +
-                        src + "'")
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
---- total optional groups in `items` (nested included).
-count_groups := (self, items) ~> while { xs: items, n: 0 } {
-  (xs, n) ~> match xs {
-    []: { out: n },
-    [it, ...t]: { state: { xs: t, n: n + if it.k == "group" {
-        1 + self(self, it.items)
-      } else {
-        0
-      } } }
-  }
-}
-
-nname_str := (s) ~> str.length(scan_name(s, 0)) == str.length(s)
-
---- true when segment `seg` uses v3 productions (anything but a plain
---- literal, a pure `:name` or a trailing `*name`/`*`).
-seg_needs := (seg) ~> do {
-  if str.is_empty(seg) {
-    false
-  } else {
-    c0 := str.char_at(seg, 0)
-    if c0 == ":" {
-      r := str.slice(seg, 1, str.length(seg))
-      str.is_empty(r) || nname_str(r) == false
-    } else {
-      if c0 == "*" {
-        nname_str(str.slice(seg, 1, str.length(seg))) == false
-      } else {
-        str.find(seg, ":") >= 0 || str.find(seg, "*") >= 0
-      }
-    }
-  }
-}
-
---- true when the path part uses v3 grammar (parens or non-v2
---- segments); such patterns go through the compiled matcher.
-needs_compile := (p) ~> do {
-  if str.find(p, "(") >= 0 || str.find(p, ")") >= 0 {
-    true
-  } else {
-    while { xs: str.split(p, "/"), found: false } {
-      (xs, found) ~> match xs {
-        []: { out: found },
-        [s, ...t]: if found || seg_needs(s) {
-          { out: true }
-        } else {
-          { state: { xs: t, found: found } }
-        }
-      }
-    }
-  }
-}
-
---- per-item specificity score. Literal segment = 2, pure `:param` = 1,
---- mixed literal+param segment (suffix/prefix vars) = 1.5, optional
---- group present = 0.5, splat = 0 -- interleaved with the v2 scores
---- (literal 2 > param 1 > splat 0) so old and new patterns compare.
-parts_score := (parts) ~> do {
-  if alen(parts) == 0 {
-    2
-  } else {
-    if alen(parts) == 1 {
-      if parts[0].t == "param" {
-        1
-      } else {
-        2
-      }
-    } else {
-      do {
-        all_lit := while { xs: parts, ok: true } {
-          (xs, ok) ~> match xs {
-            []: { out: ok },
-            [p, ...t]: if p.t == "lit" {
-              { state: { xs: t, ok: ok } }
-            } else {
-              { out: false }
-            }
-          }
-        }
-        if all_lit {
-          2
-        } else {
-          1.5
-        }
-      }
-    }
-  }
-}
-
-item_score := (it) ~> if it.k == "seg" {
-  parts_score(it.parts)
-} else {
-  if it.k == "splat" {
-    0
-  } else {
-    0.5
-  }
-}
-
---- match one path segment against compiled `parts` from char `pos`;
---- returns the accumulated params record or null. A param followed by
---- a literal anchor captures greedily (longest first), so `:file.:ext`
---- on "a.b.zip" binds file="a.b", ext="zip".
-match_parts := (self, parts, s, pos, params) ~> match parts {
-  []: if pos == str.length(s) {
-    params
-  } else {
-    null
-  },
-  [p, ...rest]: if p.t == "lit" {
-    do {
-      ll := str.length(p.s)
-      if pos + ll <= str.length(s) &&
-         str.slice(s, pos, pos + ll) == p.s {
-        self(self, rest, s, pos + ll, params)
-      } else {
-        null
-      }
-    }
-  } else {
-    if alen(rest) == 0 {
-      hash_map.set(params, p.name, str.slice(s, pos, str.length(s)))
-    } else {
-      while { e: str.length(s), out: null } {
-        (e, out) ~> if e < pos {
-          { out: out }
-        } else {
-          do {
-            r := self(self, rest, s, e,
-              hash_map.set(params, p.name, str.slice(s, pos, e)))
-            if r == null {
-              { state: { e: e - 1, out: null } }
-            } else {
-              { out: r }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
---- every way to match `items` against `segs`; each result is
---- `{ params, left }` (`left` = unconsumed path segments). Optional
---- groups enumerate present-branch results before absent-branch ones,
---- so earlier groups win ambiguous binds. Branch count is bounded by
---- OPT_MAX_GROUPS (<= 8 -> <= 256 expansions).
-match_all := (self, items, segs, params) ~> match items {
-  []: [{ params: params, left: segs }],
-  [it, ...rest]: if it.k == "seg" {
-    match segs {
-      []: [],
-      [s, ...st]: do {
-        adds := match_parts(match_parts, it.parts, s, 0, {})
-        if adds == null {
-          []
-        } else {
-          self(self, rest, st, hash_map.merge(params, adds))
-        }
-      }
-    }
-  } else {
-    if it.k == "splat" {
-      [{ params: if it.name == null {
-          params
-        } else {
-          hash_map.set(params, it.name, str.join(segs, "/"))
-        },
-        left: [] }]
-    } else {
-      do {
-        pres := self(self, it.items, segs, params)
-        pcont := while { xs: pres, out: [] } {
-          (xs, out) ~> match xs {
-            []: { out: out },
-            [p, ...t]: { state: { xs: t,
-              out: cat(out, self(self, rest, p.left, p.params)) } }
-          }
-        }
-        cat(pcont, self(self, rest, segs, params))
-      }
-    }
-  }
-}
-
---- first complete compiled match's params, or null.
-compiled_match := (c, path) ~> do {
-  if c.bad {
-    null
-  } else {
-    do {
-      rs := match_all(match_all, c.items, str.split(path, "/"), {})
-      while { xs: rs, out: null } {
-        (xs, out) ~> match xs {
-          []: { out: out },
-          [r, ...t]: if alen(r.left) == 0 {
-            { out: r.params }
-          } else {
-            { state: { xs: t, out: out } }
-          }
-        }
-      }
-    }
-  }
-}
-
---- `?k=v&flag` suffix -> ordered list of `{k, v}` constraint pairs
---- (percent-decoded like `query/1`; bare keys get "").
-parse_qcons := (qs) ~> do {
-  if str.is_empty(qs) {
-    []
-  } else {
-    while { xs: str.split(qs, "&"), out: [] } {
-      (xs, out) ~> match xs {
-        []: { out: out },
-        [s, ...t]: if str.is_empty(s) {
-          { state: { xs: t, out: out } }
-        } else {
-          do {
-            i := str.find(s, "=")
-            if i < 0 {
-              { state: { xs: t,
-                out: [...out, { k: pct_decode(s), v: "" }] } }
-            } else {
-              { state: { xs: t, out: [...out,
-                { k: pct_decode(str.slice(s, 0, i)),
-                  v: pct_decode(str.slice(s, i + 1, str.length(s))) }] } }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
---- compile `pat` into `{ path, items, bad, use, constraints, score }`.
---- `use` is false for plain v1/v2 patterns (they keep the legacy
---- matcher + scorer); `constraints` always holds the `?k=v` pairs.
-compile_pat := (pat) ~> do {
-  qi := str.find(pat, "?")
-  pp := if qi < 0 { pat } else { str.slice(pat, 0, qi) }
-  qs := if qi < 0 { "" } else {
-    str.slice(pat, qi + 1, str.length(pat))
-  }
-  res := parse_list(parse_list, tokenize(pp), 0, false, 0, pp)
-  cg := count_groups(count_groups, res.items)
-  if res.bad == false && cg > OPT_MAX_GROUPS {
-    error.raise("http-route: too many optional groups in '" + pat +
-      "' (max " + type.to_string(OPT_MAX_GROUPS) + ")")
-  }
-  { path: pp, items: res.items, bad: res.bad, use: needs_compile(pp),
-    constraints: parse_qcons(qs), score: lmap(item_score, res.items) }
-}
-
 --- segment-wise match of `pattern` against `path`. Returns the params
---- record on match, null on mismatch. v1/v2 patterns use the legacy
---- matcher; v3 patterns (optional groups, suffix vars, parens) go
---- through the compiled bounded-state matcher. A `?k=v` suffix on the
---- pattern is a dispatch-time search constraint -- `match_path`
---- ignores it (it only sees the path).
-export match_path := (pattern, path) ~> do {
-  c := compile_pat(pattern)
-  if c.use {
-    compiled_match(c, path)
-  } else {
-    match_segs(str.split(c.path, "/"), str.split(path, "/"), {})
-  }
-}
+--- record on match, null on mismatch. The full v1/v2/v3 grammar lives
+--- in lib-route; a `?k=v` suffix on the pattern is a dispatch-time
+--- search constraint -- `match_path` ignores it (it only sees the
+--- path).
+export match_path := (pattern, path) ~> rt.match_path(pattern, path)
 
 -- ---------------------------------------------------------------------
 -- route maps (v2)
@@ -902,7 +313,7 @@ explicit_path := (v, fallback) ~> do {
     if is_str(pp) {
       norm_path(pp)
     } else {
-      error.raise("http-route: route 'path'/'pattern' must be a string")
+      error.raise("http-router: route 'path'/'pattern' must be a string")
     }
   }
 }
@@ -917,10 +328,10 @@ methods_of := (v) ~> do {
       lmap((m) ~> if is_str(m) {
         str.upper(m)
       } else {
-        error.raise("http-route: method names must be strings")
+        error.raise("http-router: method names must be strings")
       }, mv)
     } else {
-      error.raise("http-route: 'method'/'methods' must be a string or list")
+      error.raise("http-router: 'method'/'methods' must be a string or list")
     }
   }
   if hash_map.has(v, "methods") {
@@ -954,12 +365,12 @@ norm_cons := (v) ~> if v == null {
         if is_arr(p) && alen(p) == 2 {
           { k: p[0], v: p[1] }
         } else {
-          error.raise("http-route: 'constraints' entries must be " +
+          error.raise("http-router: 'constraints' entries must be " +
             "{k,v} pairs")
         }
       }, v)
     } else {
-      error.raise("http-route: 'constraints' must be a record or " +
+      error.raise("http-router: 'constraints' must be a record or " +
         "list of pairs")
     }
   }
@@ -979,7 +390,7 @@ is_method_map := (v) ~> do {
 spec_entries := (v, segs) ~> do {
   h := hash_map.get_or(v, "handler", null)
   chk := if is_arrow(h) { true } else {
-    error.raise("http-route: route 'handler' must be an arrow")
+    error.raise("http-router: route 'handler' must be an arrow")
   }
   path := explicit_path(v, derived_path(segs))
   nm := derived_name(segs)
@@ -1002,7 +413,7 @@ mmap_entries := (v, segs) ~> do {
         do {
           h := hash_map.get_or(v, k, null)
           if is_arrow(h) == false {
-            error.raise("http-route: method '" + k +
+            error.raise("http-router: method '" + k +
               "' leaf must be an arrow")
           } else {
             do {
@@ -1031,7 +442,7 @@ walk := (self, v, segs) ~> do {
        path: derived_path(segs), handler: v }]
   } else {
     if is_obj(v) == false {
-      error.raise("http-route: route leaf must be an arrow or record (got " +
+      error.raise("http-router: route leaf must be an arrow or record (got " +
         type.of(v) + ")")
     } else {
       if hash_map.has(v, "handler") {
@@ -1095,7 +506,7 @@ entries_of := (routes) ~> do {
 }
 
 -- ---------------------------------------------------------------------
--- dispatch
+-- dispatch (lib-route trie + HTTP shell: methods, constraints, 405/404)
 -- ---------------------------------------------------------------------
 
 --- route method check: absent or "*" matches anything, else exact
@@ -1104,6 +515,14 @@ method_ok := (r, m) ~> do {
   rm := hash_map.get_or(r, "method", "*")
   rm == "*" || rm == m
 }
+
+--- the `{k, v}` search constraints a candidate carries: leaf-level
+--- `entry.constraints` (normalized by `norm_cons`) plus whatever
+--- lib-route merged in from the pattern's `?k=v` suffix (looked up on
+--- both the candidate and its entry so either merge site works).
+cons_of := (cand) ~> cat(
+  hash_map.get_or(cand, "constraints", []),
+  hash_map.get_or(cand.entry, "constraints", []))
 
 --- every `{k, v}` search constraint holds against the request's
 --- parsed query record `qps`: key `k` must be present with value `v`
@@ -1123,61 +542,12 @@ cons_ok := (cons, qps) ~> while { xs: cons, ok: true } {
   }
 }
 
---- every entry whose path pattern (and search constraints) match,
---- as `{ route, params, score }` candidates in list order.
-collect := (routes, p, qps) ~> while { xs: routes, out: [] } {
-  (xs, out) ~> match xs {
-    []: { out: out },
-    [r, ...t]: do {
-      pat := hash_map.get_or(r, "path",
-        hash_map.get_or(r, "pattern", null))
-      if pat == null || is_str(pat) == false {
-        { state: { xs: t, out: out } }
-      } else {
-        do {
-          comp := hash_map.get_or(r, "compiled", null)
-          prm := if comp != null {
-            compiled_match(comp, p)
-          } else {
-            match_path(pat, p)
-          }
-          if prm == null ||
-             cons_ok(hash_map.get_or(r, "constraints", []), qps) == false {
-            { state: { xs: t, out: out } }
-          } else {
-            { state: { xs: t, out: cat(out, [
-              { route: r, params: prm,
-                score: if comp != null {
-                  comp.score
-                } else {
-                  pat_score(pat)
-                } }]) } }
-          }
-        }
-      }
-    }
-  }
-}
-
---- highest-specificity candidate; equal scores keep list order.
-pick_best := (cs) ~> while { xs: cs, best: null } {
-  (xs, best) ~> match xs {
-    []: { out: best },
-    [c, ...t]: if best == null {
-      { state: { xs: t, best: c } }
-    } else {
-      { state: { xs: t,
-        best: if score_better(c.score, best.score) { c } else { best } } }
-    }
-  }
-}
-
 --- distinct methods of path-matching candidates, in encounter order.
 allow_methods := (cands) ~> while { xs: cands, acc: [] } {
   (xs, acc) ~> match xs {
     []: { out: acc },
     [c, ...t]: do {
-      m := hash_map.get_or(c.route, "method", "*")
+      m := hash_map.get_or(c.entry, "method", "*")
       if mem(m, acc) {
         { state: { xs: t, acc: acc } }
       } else {
@@ -1199,29 +569,33 @@ method_not_allowed := (cands) ~> do {
 --- the default miss response (plain text, like serve-epoll's 400s).
 export not_found := { status: 404, body: "not found" }
 
---- dispatch `req` through normalized entry list `es`.
-dispatch_list := (es, req) ~> do {
+--- dispatch `req` through a compiled lib-route `trie` (built once by
+--- `router`/`route`). `rt.dispatch` returns the best candidate passing
+--- `accept` plus the full sorted path-match list; path+constraint
+--- matches with no method-compatible entry -> 405, none at all -> 404.
+dispatch_list := (trie, req) ~> do {
   m := hash_map.get_or(req, "method", "")
   p := hash_map.get_or(req, "path", "")
   qps := query(hash_map.get_or(req, "query", ""))
-  cands := collect(es, p, qps)
-  mc := lfilter((c) ~> method_ok(c.route, m), cands)
-  if alen(mc) == 0 {
-    if alen(cands) == 0 {
+  r := rt.dispatch(trie, str.split(p, "/"),
+    (cand) ~> method_ok(cand.entry, m) &&
+      cons_ok(cons_of(cand), qps))
+  if r.hit == null {
+    pc := lfilter((cand) ~> cons_ok(cons_of(cand), qps), r.cands)
+    if alen(pc) == 0 {
       not_found
     } else {
-      method_not_allowed(cands)
+      method_not_allowed(pc)
     }
   } else {
     do {
-      best := pick_best(mc)
-      h := hash_map.get_or(best.route, "handler", null)
+      h := hash_map.get_or(r.hit.entry, "handler", null)
       if is_arrow(h) == false {
-        error.raise("http-route: matched route has no arrow handler")
+        error.raise("http-router: matched route has no arrow handler")
       } else {
         do {
           req2 := hash_map.merge(req, {
-            params: best.params,
+            params: r.hit.params,
             query_params: qps
           })
           h(req2)
@@ -1230,36 +604,6 @@ dispatch_list := (es, req) ~> do {
     }
   }
 }
-
---- compile one entry's path pattern once (v3 grammar): v3 patterns
---- get a `compiled` record `{ items, bad, score }` for the bounded-state
---- matcher, and `?k=v` search constraints merge into `entry.constraints`
---- (appended after any leaf-level `constraints`).
-mark_one := (e) ~> do {
-  pat := hash_map.get_or(e, "path",
-    hash_map.get_or(e, "pattern", null))
-  if pat == null || is_str(pat) == false {
-    e
-  } else {
-    do {
-      c := compile_pat(pat)
-      e1 := if alen(c.constraints) > 0 {
-        hash_map.set(e, "constraints",
-          cat(hash_map.get_or(e, "constraints", []), c.constraints))
-      } else {
-        e
-      }
-      if c.use {
-        hash_map.set(e1, "compiled",
-          { items: c.items, bad: c.bad, score: c.score })
-      } else {
-        e1
-      }
-    }
-  }
-}
-
-mark_entries := (es) ~> lmap(mark_one, es)
 
 --- arity 1: build a route-map record from `{ name: leaf|nested }`
 --- (a legacy entry list passes through as `{ entries, by_name: {} }`).
@@ -1274,16 +618,16 @@ export route := (a, ...rest) ~> do {
       build(a)
     }
   } else {
-    dispatch_list(mark_entries(entries_of(a)), rest[0])
+    dispatch_list(rt.compile(entries_of(a)), rest[0])
   }
 }
 
 --- serve-ready handler: `serve(router(routes), { port })`. `routes` may
 --- be a legacy entry list, a route-map record or a raw route map (built
---- and compiled once here, not per request).
+--- and compiled into a lib-route trie once here, not per request).
 export router := (routes) ~> do {
-  es := mark_entries(entries_of(routes))
-  (req) ~> dispatch_list(es, req)
+  trie := rt.compile(entries_of(routes))
+  (req) ~> dispatch_list(trie, req)
 }
 
 -- ---------------------------------------------------------------------
@@ -1300,7 +644,7 @@ subst_seg := (s, params, pat) ~> do {
         k := str.slice(s, 1, str.length(s))
         v := hash_map.get_or(params, k, null)
         if v == null {
-          error.raise("http-route: href missing param '" + k +
+          error.raise("http-router: href missing param '" + k +
             "' for '" + pat + "'")
         } else {
           str_of(v)
@@ -1316,7 +660,7 @@ subst_seg := (s, params, pat) ~> do {
               k := str.slice(s, 1, str.length(s))
               v := hash_map.get_or(params, k, null)
               if v == null {
-                error.raise("http-route: href missing param '" + k +
+                error.raise("http-router: href missing param '" + k +
                   "' for '" + pat + "'")
               } else {
                 str_of(v)
@@ -1342,7 +686,7 @@ seg_str := (parts, params, pat) ~> while { xs: parts, acc: "" } {
         do {
           v := hash_map.get_or(params, p.name, null)
           if v == null {
-            error.raise("http-route: href missing param '" + p.name +
+            error.raise("http-router: href missing param '" + p.name +
               "' for '" + pat + "'")
           } else {
             str_of(v)
@@ -1363,7 +707,7 @@ splat_str := (it, params, pat) ~> do {
     do {
       v := hash_map.get_or(params, it.name, null)
       if v == null {
-        error.raise("http-route: href missing param '" + it.name +
+        error.raise("http-router: href missing param '" + it.name +
           "' for '" + pat + "'")
       } else {
         str_of(v)
@@ -1474,21 +818,21 @@ href_target := (a) ~> do {
           hash_map.get_or(a, "pattern", null)),
         cons: hash_map.get_or(a, "constraints", []) }
     } else {
-      error.raise("http-route: href target must be a pattern string or route record")
+      error.raise("http-router: href target must be a pattern string or route record")
     }
   }
 }
 
 href_pat := (pat, params, extra) ~> do {
   if is_str(pat) == false || pat == null {
-    error.raise("http-route: href target has no path pattern")
+    error.raise("http-router: href target has no path pattern")
   } else {
     do {
       if is_obj(params) == false {
-        error.raise("http-route: href params must be a record")
+        error.raise("http-router: href params must be a record")
       } else {
         do {
-          c := compile_pat(pat)
+          c := rt.compile_pat(pat)
           base := if c.use {
             emit_items(c.items, params, pat)
           } else {
@@ -1516,7 +860,7 @@ lookup_name := (m, name) ~> do {
   }
   e := hash_map.get_or(bm.by_name, name, null)
   if e == null {
-    error.raise("http-route: no route named '" + name + "'")
+    error.raise("http-router: no route named '" + name + "'")
   } else {
     e
   }
@@ -1545,7 +889,7 @@ export href := (a, ...rest) ~> do {
     if alen(rest) == 1 {
       href2(a, rest[0])
     } else {
-      error.raise("http-route: href expects (pattern, params) or (map, name, params)")
+      error.raise("http-router: href expects (pattern, params) or (map, name, params)")
     }
   }
 }
@@ -1598,11 +942,11 @@ res_methods := (mv) ~> if is_str(mv) {
     lmap((m) ~> if is_str(m) {
       str.upper(m)
     } else {
-      error.raise("http-route: resource 'methods' entries must be " +
+      error.raise("http-router: resource 'methods' entries must be " +
         "strings")
     }, mv)
   } else {
-    error.raise("http-route: resource 'methods' must be a string " +
+    error.raise("http-router: resource 'methods' must be a string " +
       "or list")
   }
 }
@@ -1638,7 +982,7 @@ res_sel := (opts, appl) ~> do {
     true
   } else {
     if is_arr(v) == false {
-      error.raise("http-route: resource '" + what +
+      error.raise("http-router: resource '" + what +
         "' must be a list of action names")
     } else {
       while { ys: v, ok: true } {
@@ -1656,11 +1000,11 @@ res_sel := (opts, appl) ~> do {
   o := chk(only, "only")
   e := chk(except, "except")
   if o == false {
-    error.raise("http-route: resource 'only' entries must be known " +
+    error.raise("http-router: resource 'only' entries must be known " +
       "actions")
   } else {
     if e == false {
-      error.raise("http-route: resource 'except' entries must be " +
+      error.raise("http-router: resource 'except' entries must be " +
         "known actions")
     } else {
       lfilter((a) ~> do {
@@ -1675,10 +1019,10 @@ res_sel := (opts, appl) ~> do {
 --- build the fragment record `{ action: { methods, path, handler } }`.
 res_build := (plural, name, handlers, opts) ~> do {
   if is_str(name) == false || str.is_empty(name) {
-    error.raise("http-route: resource name must be a non-empty string")
+    error.raise("http-router: resource name must be a non-empty string")
   } else {
     if is_obj(opts) == false {
-      error.raise("http-route: resource options must be a record")
+      error.raise("http-router: resource options must be a record")
     } else {
       do {
         appl := if plural { RES_ACTIONS } else { RES_SINGULAR }
@@ -1686,13 +1030,13 @@ res_build := (plural, name, handlers, opts) ~> do {
           null
         } else {
           if is_obj(handlers) == false {
-            error.raise("http-route: resource handlers must be an " +
+            error.raise("http-router: resource handlers must be an " +
               "arrow or a record of action arrows")
           } else {
             do {
               bk := res_bad_key(handlers, appl)
               if bk != null {
-                error.raise("http-route: unknown resource action '" +
+                error.raise("http-router: unknown resource action '" +
                   bk + "'")
               } else {
                 handlers
@@ -1703,14 +1047,14 @@ res_build := (plural, name, handlers, opts) ~> do {
         base := norm_path(hash_map.get_or(opts, "path", "/" + name))
         param := hash_map.get_or(opts, "param", "id")
         if is_str(param) == false || str.is_empty(param) {
-          error.raise("http-route: resource 'param' must be a " +
+          error.raise("http-router: resource 'param' must be a " +
             "non-empty string")
         } else {
           do {
             sel := res_sel(opts, appl)
             mopt := hash_map.get_or(opts, "methods", null)
             if mopt != null && is_obj(mopt) == false {
-              error.raise("http-route: resource 'methods' must be a " +
+              error.raise("http-router: resource 'methods' must be a " +
                 "record of action -> method(s)")
             } else {
               while { xs: sel, out: {} } {
@@ -1726,7 +1070,7 @@ res_build := (plural, name, handlers, opts) ~> do {
                       { state: { xs: t, out: out } }
                     } else {
                       if is_arrow(h) == false {
-                        error.raise("http-route: resource action '" + a +
+                        error.raise("http-router: resource action '" + a +
                           "' must be an arrow")
                       } else {
                         do {

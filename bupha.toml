@@ -1,12 +1,12 @@
-# bupha.toml — committed CI manifest for handl-lang/lib-http-route.
+# bupha.toml — committed CI manifest for handl-lang/lib-http-router.
 #
 # Runner is this repo's ci.sh (scripts/hnl-gate.sh: typecheck + lint + test
 # over the package's .hnl sources). Merge the [[repos]] entry into the shared
 # watcher (~/.config/bupha/bupha.toml) or run: bupha watch --config bupha.toml
 
 [[repos]]
-name = "handl-lang/lib-http-route"
-dir = "~//GitHub/handl-lang/lib-http-route"
+name = "handl-lang/lib-http-router"
+dir = "~//GitHub/handl-lang/lib-http-router"
 branch = "refs/heads/main"
   [repos.runner]
   kind = "script"

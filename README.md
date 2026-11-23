@@ -1,15 +1,18 @@
-# lib-http-route
+# lib-http-router
 
-`http-route` — the routing layer between `serve` (lib-serve /
-serve-epoll) and Handl handler arrows, in pure handl. This is the
-missing piece flagged in P-004: `serve`/`serve-epoll` provide the
-accept loop and `http-rfc` the wire codec, but routing lived inline in
-the handler. Now it is a library.
+`http-router` — the HTTP routing layer between `serve` (lib-serve /
+serve-epoll) and Handl handler arrows, in pure handl, built on
+[`lib-route`](https://github.com/handl-lang/lib-route) (the generic
+route-pattern library: trie compile, specificity-ranked dispatch,
+`match_path`, `compile_pat`). This is the missing piece flagged in
+P-004: `serve`/`serve-epoll` provide the accept loop and `http-rfc`
+the wire codec, but routing lived inline in the handler. Now it is a
+library.
 
 `serve` hands the handler a parsed request record
 `{ method, target, path, query, version, headers, body, body_bytes }`
 (lib-http-rfc shape) and expects a response record back
-`{ status?, headers?, body? | body_bytes? }`. `http-route` dispatches
+`{ status?, headers?, body? | body_bytes? }`. `http-router` dispatches
 on method + path pattern, remix-style.
 
 ## v2 — named route maps
@@ -19,7 +22,7 @@ record of named leaves and nested maps. The key path becomes the URL
 path; `"."` (or `""`) is the index/root route.
 
 ```handl
-from "http-route" import * as rt
+from "http-router" import * as rt
 from "serve-epoll" import { serve }
 
 app := rt.route({
@@ -99,8 +102,13 @@ passed to `route/1` wraps as `{ entries, by_name: {} }`).
 - `json_body(req)` — `json.parse(req.body)`, `null` when empty.
 - `not_found` — the default `{ status: 404, body: "not found" }`.
 
-Arity is strict — no optional parameters (`( )`, suffix vars, search
-constraints are deferred). The custom-fallback story is a trailing
+Path patterns support the full lib-route grammar: literals, `:param`,
+trailing `*`/`*name` splats, v3 optional groups `(/seg)`, suffix/prefix
+vars (`:file.:ext`), and `?k=v` search constraints (a constraint miss
+is a 404, not a 405). `match_path(pattern, path)` delegates to
+lib-route's matcher.
+
+The custom-fallback story is a trailing
 `{ method: "*", path: "*" }` entry — note it now ranks *least*
 specific, so it only catches what nothing else did, and a method
 mismatch on it still 405s only when its own method doesn't match.
@@ -108,8 +116,9 @@ mismatch on it still 405s only when its own method doesn't match.
 ## Layout
 
 ```text
-src/index.hnl        the router (pure handl; deps: str, char, typeof,
-                     hash_map, json — all builtin kit modules)
+src/index.hnl        the router (pure handl; deps: route (lib-route),
+                     str, char, typeof, hash_map, json — all builtin
+                     kit modules except route)
 src/index.test.hnl   89 tests: match_path, query, route/router,
                      route maps, href, form, specificity, 405, json_body
 pkg.hnl              package manifest — modules, deps, license

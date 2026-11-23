@@ -1,10 +1,11 @@
---- http-route.test -- coverage for the routing layer (`src/index.hnl`).
+--- http-router.test -- coverage for the routing layer (`src/index.hnl`).
 ---
---- Exercises match_path (literals, :params, `*`/`*name` wildcards),
---- query parsing (repeats, percent/plus decoding), route/router dispatch
---- (method matching, specificity ranking, params + query_params
---- injection, 404/405/fallback), named route maps + href + form (v2),
---- and json_body.
+--- Exercises match_path (literals, :params, `*`/`*name` wildcards --
+--- delegated to lib-route), query parsing (repeats, percent/plus
+--- decoding), route/router dispatch (method matching, specificity
+--- ranking, params + query_params injection, 404/405/fallback), named
+--- route maps + href + form (v2), v3 optional groups / suffix vars /
+--- search constraints, and json_body.
 
 from "./index" import * as rt
 from "str" import * as str
@@ -1218,3 +1219,56 @@ test_res_err_bad_only := assert match error.try(
 test_res_err_sing_index := assert match error.try(
   (x) ~> rt.resource("profile", { index: get_h })) {
   err(e): true, _: false }
+
+-- ---------------------------------------------------------------------
+-- v3 through the lib-route dispatch core: params reach the handler
+-- ---------------------------------------------------------------------
+
+dl_h := (r) ~> do {
+  { status: 200, body: "dl " + r.params.file + "." + r.params.ext }
+}
+
+opt_h := (r) ~> do {
+  { status: 200,
+    body: "opt " + hash_map.get_or(r.params, "name", "NONE") }
+}
+
+v3_dispatch := rt.router([
+  { method: "GET", path: "/dl/:file.:ext", handler: dl_h },
+  { method: "GET", path: "/opt(/:name)", handler: opt_h }
+])
+
+test_v3_dispatch_suffix_params := assert v3_dispatch(
+  mkreq("GET", "/dl/a.b.zip")) = { status: 200, body: "dl a.b.zip" }
+
+test_v3_dispatch_opt_present := assert v3_dispatch(
+  mkreq("GET", "/opt/x")) = { status: 200, body: "opt x" }
+
+test_v3_dispatch_opt_absent := assert v3_dispatch(
+  mkreq("GET", "/opt")) = { status: 200, body: "opt NONE" }
+
+test_v3_dispatch_404 := assert v3_dispatch(mkreq("GET", "/dl")) =
+  { status: 404, body: "not found" }
+
+-- ?k=v suffix constraint: miss is a 404 even when the method also
+-- mismatches; hit still 405s on method alone.
+
+cons_dispatch := rt.router(rt.route({
+  s: { get: get_h, path: "/items?foo=bar" }
+}))
+
+test_v3_disp_con_hit := assert cons_dispatch(
+  mkreqq("GET", "/items", "foo=bar")) = { status: 200, body: "GET" }
+
+test_v3_disp_con_404 := assert cons_dispatch(
+  mkreqq("GET", "/items", "foo=no")) =
+  { status: 404, body: "not found" }
+
+test_v3_disp_con_405 := assert cons_dispatch(
+  mkreqq("POST", "/items", "foo=bar")) =
+  { status: 405, headers: { allow: "GET" },
+    body: "method not allowed" }
+
+test_v3_disp_con_404_not_405 := assert cons_dispatch(
+  mkreqq("POST", "/items", "foo=no")) =
+  { status: 404, body: "not found" }

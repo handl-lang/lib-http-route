@@ -7,6 +7,8 @@
 --- and json_body.
 
 from "./index" import * as rt
+from "str" import * as str
+from "char" import * as char
 
 -- ---------------------------------------------------------------------
 -- fixtures
@@ -425,3 +427,794 @@ test_form_post := assert rt.router(login_map)(mkreq("POST", "/login")) =
 test_form_direct := assert rt.router(rt.route({
   f: rt.form("/f", { get: get_h, post: post_h })
 }))(mkreq("POST", "/f")) = { status: 200, body: "POST" }
+
+-- ---------------------------------------------------------------------
+-- v3: optional groups, suffix vars, search constraints (P-005)
+-- ---------------------------------------------------------------------
+
+mkreqq := (m, p, q) ~> do {
+  { method: m, path: p, query: q, version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }
+}
+
+-- optional groups
+
+test_v3_opt_absent := assert rt.match_path("/files(/:name)", "/files") = {}
+
+test_v3_opt_present := assert rt.match_path("/files(/:name)", "/files/x") =
+  { name: "x" }
+
+test_v3_opt_extra_seg := assert rt.match_path("/files(/:name)",
+  "/files/x/y") = null
+
+test_v3_opt_nested_all := assert rt.match_path("/a(/b(/c))", "/a/b/c") = {}
+
+test_v3_opt_nested_mid := assert rt.match_path("/a(/b(/c))", "/a/b") = {}
+
+test_v3_opt_nested_none := assert rt.match_path("/a(/b(/c))", "/a") = {}
+
+test_v3_opt_nested_skip := assert rt.match_path("/a(/b(/c))", "/a/c") = null
+
+test_v3_opt_siblings := assert rt.match_path("/a(/b)(/c)", "/a/b/c") = {}
+
+test_v3_opt_siblings_one := assert rt.match_path("/a(/b)(/c)", "/a/b") = {}
+
+test_v3_opt_siblings_two := assert rt.match_path("/a(/b)(/c)", "/a/c") = {}
+
+test_v3_opt_siblings_params := assert rt.match_path("/x(/:a)/y(/:b)",
+  "/x/1/y/2") = { a: "1", b: "2" }
+
+test_v3_opt_first_wins := assert rt.match_path("/x(/:a)/y(/:b)",
+  "/x/y/2") = { b: "2" }
+
+test_v3_opt_lit_group := assert rt.match_path("/one(/two/three)",
+  "/one/two/three") = {}
+
+test_v3_opt_lit_group_partial := assert rt.match_path(
+  "/one(/two/three)", "/one/two") = null
+
+test_v3_opt_trailing_slash := assert rt.match_path("/files(/:name)",
+  "/files/") = { name: "" }
+
+-- suffix / prefix vars inside a segment
+
+test_v3_suffix_basic := assert rt.match_path("/dl/:file.:ext",
+  "/dl/a.zip") = { file: "a", ext: "zip" }
+
+test_v3_suffix_greedy := assert rt.match_path("/dl/:file.:ext",
+  "/dl/a.b.zip") = { file: "a.b", ext: "zip" }
+
+test_v3_suffix_empty_param := assert rt.match_path("/dl/:file.:ext",
+  "/dl/.zip") = { file: "", ext: "zip" }
+
+test_v3_suffix_no_dot := assert rt.match_path("/dl/:file.:ext", "/dl/a") =
+  null
+
+test_v3_prefix_param := assert rt.match_path("(/v:version)/status",
+  "/v2/status") = { version: "2" }
+
+test_v3_prefix_param_skip := assert rt.match_path("(/v:version)/status",
+  "/status") = {}
+
+test_v3_mixed_seg := assert rt.match_path("/m/:a+:b", "/m/x+y+z") =
+  { a: "x+y", b: "z" }
+
+test_v3_suffix_plus_opt := assert rt.match_path("/p/:x.:y(/:z)",
+  "/p/1.2/3") = { x: "1", y: "2", z: "3" }
+
+test_v3_suffix_plus_opt_skip := assert rt.match_path("/p/:x.:y(/:z)",
+  "/p/1.2") = { x: "1", y: "2" }
+
+-- splat + optional combos
+
+test_v3_splat_opt_present := assert rt.match_path("/files(/:dir)/*rest",
+  "/files/a/b/c") = { dir: "a", rest: "b/c" }
+
+test_v3_splat_opt_greedy := assert rt.match_path("/files(/:dir)/*rest",
+  "/files/b/c") = { dir: "b", rest: "c" }
+
+test_v3_splat_opt_empty := assert rt.match_path("/files(/:dir)/*rest",
+  "/files") = { rest: "" }
+
+test_v3_splat_not_last_v3 := assert rt.match_path("/a/*r(/b)",
+  "/a/1/2") = null
+
+-- literal parens / stars stay literal outside the grammar
+
+test_v3_literal_parens := assert rt.match_path("/a(b)c", "/a(b)c") = {}
+
+test_v3_literal_parens_miss := assert rt.match_path("/a(b)c", "/abc") =
+  null
+
+test_v3_stray_rparen_literal := assert rt.match_path("/a)b", "/a)b") = {}
+
+-- malformed patterns raise at compile time
+
+test_v3_err_unbalanced := assert match error.try(
+  (x) ~> rt.match_path("/a(/b", "/a")) { err(e): true, _: false }
+
+test_v3_err_unclosed_nested := assert match error.try(
+  (x) ~> rt.match_path("/a(/b(/c)", "/a/b/c")) { err(e): true, _: false }
+
+test_v3_err_group_no_slash := assert match error.try(
+  (x) ~> rt.match_path("/a(/b)c", "/a/bc")) { err(e): true, _: false }
+
+test_v3_err_adjacent_params := assert match error.try(
+  (x) ~> rt.match_path("/:a:b", "/x")) { err(e): true, _: false }
+
+test_v3_err_empty_param := assert match error.try(
+  (x) ~> rt.match_path("/:.", "/x")) { err(e): true, _: false }
+
+test_v3_err_too_deep := assert match error.try(
+  (x) ~> rt.match_path("/a(/b(/c(/d(/e(/f)))))", "/a/b/c/d/e/f")) {
+  err(e): true, _: false }
+
+test_v3_err_too_many_groups := assert match error.try(
+  (x) ~> rt.match_path(
+    "/a(/b)(/c)(/d)(/e)(/f)(/g)(/h)(/i)(/j)", "/a/b")) {
+  err(e): true, _: false }
+
+-- search constraints
+
+test_v3_con_ok := assert rt.route(rt.route({
+  s: { get: get_h, path: "/items?foo=bar" } }),
+  mkreqq("GET", "/items", "foo=bar")) = { status: 200, body: "GET" }
+
+test_v3_con_extra_q := assert rt.route(rt.route({
+  s: { get: get_h, path: "/items?foo=bar" } }),
+  mkreqq("GET", "/items", "x=1&foo=bar")) = { status: 200, body: "GET" }
+
+test_v3_con_miss_value := assert rt.route(rt.route({
+  s: { get: get_h, path: "/items?foo=bar" } }),
+  mkreqq("GET", "/items", "foo=baz")) = { status: 404, body: "not found" }
+
+test_v3_con_miss_absent := assert rt.route(rt.route({
+  s: { get: get_h, path: "/items?foo=bar" } }),
+  mkreqq("GET", "/items", "")) = { status: 404, body: "not found" }
+
+test_v3_con_multi := assert rt.route(rt.route({
+  s: { get: get_h, path: "/items?foo=bar&baz=1" } }),
+  mkreqq("GET", "/items", "baz=1&foo=bar")) = { status: 200, body: "GET" }
+
+test_v3_con_405_preserved := assert rt.route(rt.route({
+  s: { get: get_h, path: "/items?foo=bar" } }),
+  mkreqq("POST", "/items", "foo=bar")) =
+  { status: 405, headers: { allow: "GET" },
+    body: "method not allowed" }
+
+test_v3_con_404_on_miss_not_405 := assert rt.route(rt.route({
+  s: { get: get_h, path: "/items?foo=bar" } }),
+  mkreqq("POST", "/items", "foo=no")) = { status: 404, body: "not found" }
+
+test_v3_con_leaf_record := assert rt.route(rt.route({
+  s: { method: "GET", path: "/c", constraints: { q: "yes" },
+       handler: get_h } }),
+  mkreqq("GET", "/c", "q=yes")) = { status: 200, body: "GET" }
+
+test_v3_con_leaf_record_miss := assert rt.route(rt.route({
+  s: { method: "GET", path: "/c", constraints: { q: "yes" },
+       handler: get_h } }),
+  mkreqq("GET", "/c", "q=no")) = { status: 404, body: "not found" }
+
+test_v3_con_mmap := assert rt.route(rt.route({
+  s: { get: get_h, path: "/mm", constraints: { t: "1" } } }),
+  mkreqq("GET", "/mm", "t=1")) = { status: 200, body: "GET" }
+
+-- v3 specificity
+
+spec_v3 := [
+  { path: "/files/:name", handler: id_h },
+  { path: "/files(/:name)", handler: new_h }
+]
+
+test_v3_spec_mandatory_beats_opt := assert rt.route(spec_v3,
+  mkreq("GET", "/files/x")) = { status: 200, body: "id" }
+
+test_v3_spec_opt_still_matches := assert rt.route(spec_v3,
+  mkreq("GET", "/files")) = { status: 200, body: "new" }
+
+spec_v3_lit := [
+  { path: "/a(/b)", handler: id_h },
+  { path: "/a/b", handler: new_h }
+]
+
+test_v3_spec_literal_beats_opt := assert rt.route(spec_v3_lit,
+  mkreq("GET", "/a/b")) = { status: 200, body: "new" }
+
+suf_h := (_r) ~> do { { status: 200, body: "suf" } }
+par_h := (_r) ~> do { { status: 200, body: "par" } }
+
+spec_v3_suffix := [
+  { path: "/dl/:name", handler: par_h },
+  { path: "/dl/:file.:ext", handler: suf_h }
+]
+
+test_v3_spec_suffix_beats_param := assert rt.route(spec_v3_suffix,
+  mkreq("GET", "/dl/a.zip")) = { status: 200, body: "suf" }
+
+test_v3_spec_param_fallback := assert rt.route(spec_v3_suffix,
+  mkreq("GET", "/dl/plain")) = { status: 200, body: "par" }
+
+-- 405/404 through v3 patterns
+
+v3_routes := [
+  { method: "GET", path: "/a(/b)", handler: get_h }
+]
+
+test_v3_405_opt := assert rt.route(v3_routes, mkreq("POST", "/a/b")) =
+  { status: 405, headers: { allow: "GET" },
+    body: "method not allowed" }
+
+test_v3_405_opt_absent := assert rt.route(v3_routes,
+  mkreq("POST", "/a")) =
+  { status: 405, headers: { allow: "GET" },
+    body: "method not allowed" }
+
+test_v3_404_v3 := assert rt.route(v3_routes, mkreq("GET", "/a/c")) =
+  { status: 404, body: "not found" }
+
+-- href round-trips for all grammar kinds
+
+test_v3_href_opt_on := assert rt.href("/files(/:name)", { name: "x" }) =
+  "/files/x"
+
+test_v3_href_opt_off := assert rt.href("/files(/:name)", {}) = "/files"
+
+test_v3_href_suffix := assert rt.href("/dl/:file.:ext",
+  { file: "a", ext: "zip" }) = "/dl/a.zip"
+
+test_v3_href_prefix := assert rt.href("(/v:version)/status",
+  { version: "2" }) = "/v2/status"
+
+test_v3_href_prefix_skip := assert rt.href("(/v:version)/status",
+  {}) = "/status"
+
+test_v3_href_splat_opt := assert rt.href("/files(/:dir)/*rest",
+  { dir: "a", rest: "b/c" }) = "/files/a/b/c"
+
+test_v3_href_splat_opt_off := assert rt.href("/files(/:dir)/*rest",
+  { rest: "b/c" }) = "/files/b/c"
+
+test_v3_href_constraints := assert rt.href("/items?foo=bar", {}) =
+  "/items?foo=bar"
+
+test_v3_href_rt_opt := assert rt.match_path("/files(/:name)",
+  rt.href("/files(/:name)", { name: "x" })) = { name: "x" }
+
+test_v3_href_rt_opt_off := assert rt.match_path("/files(/:name)",
+  rt.href("/files(/:name)", {})) = {}
+
+test_v3_href_rt_suffix := assert rt.match_path("/dl/:file.:ext",
+  rt.href("/dl/:file.:ext", { file: "a.b", ext: "zip" })) =
+  { file: "a.b", ext: "zip" }
+
+test_v3_href_rt_nested := assert rt.match_path("/a(/b(/c))",
+  rt.href("/a(/b(/c))", {})) = {}
+
+test_v3_href_entry_v3 := assert rt.href(rt.route({
+  f: { get: get_h, path: "/files(/:name)" } }), "f",
+  { name: "n" }) = "/files/n"
+
+test_v3_href_missing_group_param := assert rt.href("/x(/:a)/y(/:b)",
+  { b: "2" }) = "/x/y/2"
+
+cons_map := rt.route({
+  s: { get: get_h, path: "/items?foo=bar" }
+})
+
+test_v3_href_map_cons := assert rt.href(cons_map, "s", {}) =
+  "/items?foo=bar"
+
+cons_leaf_map := rt.route({
+  s: { method: "GET", path: "/c", constraints: { q: "yes" },
+       handler: get_h }
+})
+
+test_v3_href_leaf_cons := assert rt.href(cons_leaf_map, "s", {}) =
+  "/c?q=yes"
+
+-- ---------------------------------------------------------------------
+-- v3 differential: compiled matcher vs naive reference
+-- ---------------------------------------------------------------------
+
+tlen := (xs) ~> while { ys: xs, n: 0 } {
+  (ys, n) ~> match ys {
+    []: { out: n },
+    [_h, ...t]: { state: { ys: t, n: n + 1 } }
+  }
+}
+
+ref_nname := (c) ~> (c >= 48 && c <= 57) || (c >= 65 && c <= 90) ||
+  (c >= 97 && c <= 122) || c == 95 || c == 45
+
+ref_name := (s, i) ~> while { k: i, acc: "" } {
+  (k, acc) ~> if k < str.length(s) &&
+               ref_nname(char.code_point_at(s, k)) {
+    { state: { k: k + 1, acc: acc + str.char_at(s, k) } }
+  } else {
+    { out: acc }
+  }
+}
+
+--- independent segment scanner: literals + `:param` parts.
+ref_parts := (seg) ~> while { i: 0, n: str.length(seg), acc: [],
+  lit: "" } {
+  (i, n, acc, lit) ~> if i >= n {
+    { out: if str.is_empty(lit) {
+        acc
+      } else {
+        [...acc, { t: "l", s: lit }]
+      } }
+  } else {
+    do {
+      c := str.char_at(seg, i)
+      if c == ":" {
+        do {
+          nm := ref_name(seg, i + 1)
+          pre := if str.is_empty(lit) {
+            acc
+          } else {
+            [...acc, { t: "l", s: lit }]
+          }
+          { state: { i: i + 1 + str.length(nm), n: n,
+            acc: [...pre, { t: "p", name: nm }], lit: "" } }
+        }
+      } else {
+        { state: { i: i + 1, n: n, acc: acc, lit: lit + c } }
+      }
+    }
+  }
+}
+
+--- independent part matcher (same greedy-longest convention).
+ref_pm := (self, parts, s, pos, params) ~> match parts {
+  []: if pos == str.length(s) {
+    params
+  } else {
+    null
+  },
+  [p, ...rest]: if p.t == "l" {
+    do {
+      ll := str.length(p.s)
+      if pos + ll <= str.length(s) &&
+         str.slice(s, pos, pos + ll) == p.s {
+        self(self, rest, s, pos + ll, params)
+      } else {
+        null
+      }
+    }
+  } else {
+    if tlen(rest) == 0 {
+      hash_map.set(params, p.name, str.slice(s, pos, str.length(s)))
+    } else {
+      while { e: str.length(s), out: null } {
+        (e, out) ~> if e < pos {
+          { out: out }
+        } else {
+          do {
+            r := self(self, rest, s, e,
+              hash_map.set(params, p.name, str.slice(s, pos, e)))
+            if r == null {
+              { state: { e: e - 1, out: null } }
+            } else {
+              { out: r }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+ref_seg := (pseg, s) ~> do {
+  ps := ref_parts(pseg)
+  if tlen(ps) == 0 {
+    if s == "" { {} } else { null }
+  } else {
+    ref_pm(ref_pm, ps, s, 0, {})
+  }
+}
+
+ref_segs := (self, ps, ss, params) ~> match ps {
+  []: if tlen(ss) == 0 {
+    params
+  } else {
+    null
+  },
+  [p, ...pt]: match ss {
+    []: null,
+    [s, ...st]: do {
+      adds := ref_seg(p, s)
+      if adds == null {
+        null
+      } else {
+        self(self, pt, st, hash_map.merge(params, adds))
+      }
+    }
+  }
+}
+
+--- first k / drop first k elements.
+ref_take := (xs, k) ~> while { ys: xs, i: 0, out: [] } {
+  (ys, i, out) ~> match ys {
+    []: { out: out },
+    [h, ...t]: if i < k {
+      { state: { ys: t, i: i + 1, out: [...out, h] } }
+    } else {
+      { out: out }
+    }
+  }
+}
+
+ref_drop := (xs, k) ~> while { ys: xs, i: 0, out: [] } {
+  (ys, i, out) ~> match ys {
+    []: { out: out },
+    [h, ...t]: if i < k {
+      { state: { ys: t, i: i + 1, out: out } }
+    } else {
+      { state: { ys: t, i: i + 1, out: [...out, h] } }
+    }
+  }
+}
+
+--- match one group-free expanded pattern against `path`.
+ref_match_one := (ep, path) ~> do {
+  ps := str.split(ep, "/")
+  ss := str.split(path, "/")
+  n := tlen(ps)
+  lp := ps[n - 1]
+  if str.starts_with(lp, "*") {
+    pre := ref_take(ps, n - 1)
+    if tlen(ss) < n - 1 {
+      null
+    } else {
+      do {
+        r := ref_segs(ref_segs, pre, ref_take(ss, n - 1), {})
+        if r == null {
+          null
+        } else {
+          restj := str.join(ref_drop(ss, n - 1), "/")
+          nm := str.slice(lp, 1, str.length(lp))
+          if nm == "" {
+            r
+          } else {
+            hash_map.set(r, nm, restj)
+          }
+        }
+      }
+    }
+  } else {
+    if tlen(ss) != n {
+      null
+    } else {
+      ref_segs(ref_segs, ps, ss, {})
+    }
+  }
+}
+
+--- index of first group-opening '(' (next char '/' or ')'), -1 none.
+ref_find_lp := (pat) ~> while { i: 0, n: str.length(pat) } {
+  (i, n) ~> if i + 1 >= n {
+    { out: -1 }
+  } else {
+    do {
+      if str.char_at(pat, i) == "(" &&
+         (str.char_at(pat, i + 1) == "/" ||
+          str.char_at(pat, i + 1) == ")") {
+        { out: i }
+      } else {
+        { state: { i: i + 1, n: n } }
+      }
+    }
+  }
+}
+
+--- index of the ')' matching the '(' at `i`, -1 when unbalanced.
+ref_close := (pat, i) ~> while { j: i, d: 0 } {
+  (j, d) ~> if j >= str.length(pat) {
+    { out: -1 }
+  } else {
+    do {
+      c := str.char_at(pat, j)
+      nd := if c == "(" {
+        d + 1
+      } else {
+        if c == ")" { d - 1 } else { d }
+      }
+      if nd == 0 {
+        { out: j }
+      } else {
+        { state: { j: j + 1, d: nd } }
+      }
+    }
+  }
+}
+
+--- enumerate all optional-group expansions, present-branch first.
+ref_expand := (self, pat) ~> do {
+  gi := ref_find_lp(pat)
+  if gi < 0 {
+    [pat]
+  } else {
+    do {
+      pe := ref_close(pat, gi)
+      inner := str.slice(pat, gi + 1, pe)
+      rest := str.slice(pat, pe + 1, str.length(pat))
+      pre := str.slice(pat, 0, gi)
+      [...self(self, pre + inner + rest),
+       ...self(self, pre + rest)]
+    }
+  }
+}
+
+--- naive full-pattern matcher: expand groups, try each expansion.
+ref_match := (pat, path) ~> do {
+  qi := str.find(pat, "?")
+  pp := if qi < 0 { pat } else { str.slice(pat, 0, qi) }
+  exps := ref_expand(ref_expand, pp)
+  while { xs: exps, out: null } {
+    (xs, out) ~> match xs {
+      []: { out: out },
+      [e, ...t]: do {
+        r := ref_match_one(e, path)
+        if r == null {
+          { state: { xs: t, out: null } }
+        } else {
+          { out: r }
+        }
+      }
+    }
+  }
+}
+
+diff_cases := [
+  { p: "/files(/:name)", path: "/files" },
+  { p: "/files(/:name)", path: "/files/x" },
+  { p: "/files(/:name)", path: "/files/x/y" },
+  { p: "/files(/:name)", path: "/other" },
+  { p: "/files(/:name)", path: "/files/" },
+  { p: "/a(/b(/c))", path: "/a" },
+  { p: "/a(/b(/c))", path: "/a/b" },
+  { p: "/a(/b(/c))", path: "/a/b/c" },
+  { p: "/a(/b(/c))", path: "/a/c" },
+  { p: "/a(/b)(/c)", path: "/a" },
+  { p: "/a(/b)(/c)", path: "/a/b" },
+  { p: "/a(/b)(/c)", path: "/a/c" },
+  { p: "/a(/b)(/c)", path: "/a/b/c" },
+  { p: "/a(/b)(/c)", path: "/a/b/c/d" },
+  { p: "/dl/:file.:ext", path: "/dl/a.zip" },
+  { p: "/dl/:file.:ext", path: "/dl/a.b.zip" },
+  { p: "/dl/:file.:ext", path: "/dl/.zip" },
+  { p: "/dl/:file.:ext", path: "/dl/a" },
+  { p: "/dl/:file.:ext", path: "/dl/a.zip/x" },
+  { p: "(/v:version)/status", path: "/status" },
+  { p: "(/v:version)/status", path: "/v1/status" },
+  { p: "(/v:version)/status", path: "/v1.2/status" },
+  { p: "(/v:version)/status", path: "/x/status" },
+  { p: "/files(/:dir)/*rest", path: "/files" },
+  { p: "/files(/:dir)/*rest", path: "/files/a" },
+  { p: "/files(/:dir)/*rest", path: "/files/a/b/c" },
+  { p: "/files(/:dir)/*rest", path: "/files/" },
+  { p: "/x(/:a)/y(/:b)", path: "/x/y" },
+  { p: "/x(/:a)/y(/:b)", path: "/x/1/y" },
+  { p: "/x(/:a)/y(/:b)", path: "/x/1/y/2" },
+  { p: "/x(/:a)/y(/:b)", path: "/x/y/2" },
+  { p: "/p/:x.:y(/:z)", path: "/p/1.2" },
+  { p: "/p/:x.:y(/:z)", path: "/p/1.2/3" },
+  { p: "/one(/two/three)", path: "/one" },
+  { p: "/one(/two/three)", path: "/one/two/three" },
+  { p: "/one(/two/three)", path: "/one/two" },
+  { p: "/m/:a+:b", path: "/m/1+2" },
+  { p: "/m/:a+:b", path: "/m/x+y+z" }
+]
+
+diff_ok := (cases) ~> while { xs: cases, ok: true } {
+  (xs, ok) ~> match xs {
+    []: { out: ok },
+    [c, ...t]: do {
+      got := rt.match_path(c.p, c.path)
+      want := ref_match(c.p, c.path)
+      if got == want {
+        { state: { xs: t, ok: ok } }
+      } else {
+        { out: false }
+      }
+    }
+  }
+}
+
+test_v3_diff_reference := assert diff_ok(diff_cases) = true
+
+-- ---------------------------------------------------------------------
+-- v3: resources / resource REST fragments (P-006)
+-- ---------------------------------------------------------------------
+
+idx_h := (_r) ~> do { { status: 200, body: "index" } }
+show_h := (r) ~> do { { status: 200, body: "show " + r.params.id } }
+newpage_h := (_r) ~> do { { status: 200, body: "newpage" } }
+create_h := (_r) ~> do { { status: 200, body: "create" } }
+edit_h := (_r) ~> do { { status: 200, body: "edit" } }
+upd_h := (r) ~> do { { status: 200, body: "upd " + r.method } }
+del_h := (_r) ~> do { { status: 204, body: "" } }
+
+photos_h := {
+  index: idx_h, show: show_h, new: newpage_h, create: create_h,
+  edit: edit_h, update: upd_h, destroy: del_h
+}
+
+photos_frag := rt.resources("photos", photos_h)
+photos_map := rt.route({ photos: photos_frag, health: health_h })
+
+test_res_frag_show_path := assert photos_frag.show.path = "/photos/:id"
+
+test_res_frag_update_methods := assert photos_frag.update.methods =
+  ["PUT", "PATCH"]
+
+test_res_index := assert rt.router(photos_map)(mkreq("GET", "/photos")) =
+  { status: 200, body: "index" }
+
+test_res_show := assert rt.router(photos_map)(mkreq("GET", "/photos/7")) =
+  { status: 200, body: "show 7" }
+
+test_res_new := assert rt.router(photos_map)(mkreq("GET", "/photos/new")) =
+  { status: 200, body: "newpage" }
+
+test_res_create := assert rt.router(photos_map)(mkreq("POST", "/photos")) =
+  { status: 200, body: "create" }
+
+test_res_edit := assert rt.router(photos_map)(
+  mkreq("GET", "/photos/7/edit")) = { status: 200, body: "edit" }
+
+test_res_update_put := assert rt.router(photos_map)(
+  mkreq("PUT", "/photos/7")) = { status: 200, body: "upd PUT" }
+
+test_res_update_patch := assert rt.router(photos_map)(
+  mkreq("PATCH", "/photos/7")) = { status: 200, body: "upd PATCH" }
+
+test_res_destroy := assert rt.router(photos_map)(
+  mkreq("DELETE", "/photos/7")) = { status: 204, body: "" }
+
+test_res_merge_sibling := assert rt.router(photos_map)(
+  mkreq("GET", "/health")) = { status: 200, body: "ok GET" }
+
+test_res_href_show := assert rt.href(photos_frag.show, { id: "7" }) =
+  "/photos/7"
+
+test_res_href_named := assert rt.href(photos_map, "photos/show",
+  { id: "3" }) = "/photos/3"
+
+test_res_href_edit := assert rt.href(photos_map, "photos/edit",
+  { id: "3" }) = "/photos/3/edit"
+
+test_res_top_level := assert rt.router(rt.resources("photos",
+  photos_h))(mkreq("GET", "/photos/4")) =
+  { status: 200, body: "show 4" }
+
+-- single arrow handler = all actions
+
+anyres := rt.resources("things", get_h)
+
+test_res_arrow_all := assert rt.router(rt.route({
+  things: anyres }))(mkreq("DELETE", "/things/1")) =
+  { status: 200, body: "GET" }
+
+-- only / except
+
+only_frag := rt.resources("photos", photos_h, { only: ["index", "show"] })
+only_map := rt.route({ photos: only_frag })
+
+test_res_only_index := assert rt.router(only_map)(
+  mkreq("GET", "/photos")) = { status: 200, body: "index" }
+
+test_res_only_show := assert rt.router(only_map)(
+  mkreq("GET", "/photos/2")) = { status: 200, body: "show 2" }
+
+test_res_only_no_create := assert rt.router(only_map)(
+  mkreq("POST", "/photos")) =
+  { status: 405, headers: { allow: "GET" },
+    body: "method not allowed" }
+
+except_frag := rt.resources("photos", photos_h, { except: ["destroy"] })
+except_map := rt.route({ photos: except_frag })
+
+test_res_except_destroy := assert rt.router(except_map)(
+  mkreq("DELETE", "/photos/1")) =
+  { status: 405, headers: { allow: "GET, PUT, PATCH" },
+    body: "method not allowed" }
+
+test_res_except_show_ok := assert rt.router(except_map)(
+  mkreq("GET", "/photos/1")) = { status: 200, body: "show 1" }
+
+-- param / path / methods options
+
+slug_show_h := (r) ~> do {
+  { status: 200, body: "show " + r.params.slug }
+}
+
+slug_frag := rt.resources("photos", { show: slug_show_h },
+  { param: "slug" })
+slug_map := rt.route({ photos: slug_frag })
+
+test_res_param_path := assert slug_frag.show.path = "/photos/:slug"
+
+test_res_param_match := assert rt.router(slug_map)(
+  mkreq("GET", "/photos/abc")) = { status: 200, body: "show abc" }
+
+test_res_param_href := assert rt.href(slug_frag.show, { slug: "x" }) =
+  "/photos/x"
+
+admin_frag := rt.resources("photos", photos_h,
+  { path: "/admin/photos" })
+admin_map := rt.route({ photos: admin_frag })
+
+test_res_path_prefix := assert rt.router(admin_map)(
+  mkreq("GET", "/admin/photos/5")) = { status: 200, body: "show 5" }
+
+test_res_path_no_mount := assert rt.router(admin_map)(
+  mkreq("GET", "/photos/5")) = { status: 404, body: "not found" }
+
+patch_only := rt.resources("photos", photos_h,
+  { methods: { update: "patch" } })
+patch_map := rt.route({ photos: patch_only })
+
+test_res_methods_patch := assert rt.router(patch_map)(
+  mkreq("PATCH", "/photos/1")) = { status: 200, body: "upd PATCH" }
+
+test_res_methods_no_put := assert rt.router(patch_map)(
+  mkreq("PUT", "/photos/1")) =
+  { status: 405, headers: { allow: "DELETE, GET, PATCH" },
+    body: "method not allowed" }
+
+-- missing actions -> 405 via v2 machinery
+
+partial_h := { show: show_h, update: upd_h }
+partial_map := rt.route({ photos: rt.resources("photos", partial_h) })
+
+test_res_missing_405 := assert rt.router(partial_map)(
+  mkreq("DELETE", "/photos/1")) =
+  { status: 405, headers: { allow: "GET, PUT, PATCH" },
+    body: "method not allowed" }
+
+test_res_missing_index_404 := assert rt.router(partial_map)(
+  mkreq("GET", "/photos")) = { status: 404, body: "not found" }
+
+-- singular resource
+
+prof_show_h := (_r) ~> do { { status: 200, body: "prof" } }
+prof_h := { show: prof_show_h, update: upd_h, destroy: del_h }
+prof_frag := rt.resource("profile", prof_h)
+prof_map := rt.route({ profile: prof_frag })
+
+test_res_sing_show := assert rt.router(prof_map)(
+  mkreq("GET", "/profile")) = { status: 200, body: "prof" }
+
+test_res_sing_update_put := assert rt.router(prof_map)(
+  mkreq("PUT", "/profile")) = { status: 200, body: "upd PUT" }
+
+test_res_sing_update_patch := assert rt.router(prof_map)(
+  mkreq("PATCH", "/profile")) = { status: 200, body: "upd PATCH" }
+
+test_res_sing_destroy := assert rt.router(prof_map)(
+  mkreq("DELETE", "/profile")) = { status: 204, body: "" }
+
+test_res_sing_no_id := assert rt.router(prof_map)(
+  mkreq("GET", "/profile/5")) = { status: 404, body: "not found" }
+
+test_res_sing_href := assert rt.href(prof_frag.show, {}) = "/profile"
+
+test_res_sing_no_index := assert hash_map.has(prof_frag, "index") ==
+  false
+
+-- resource option validation
+
+test_res_err_unknown_action := assert match error.try(
+  (x) ~> rt.resources("photos", { bogus: get_h })) {
+  err(e): true, _: false }
+
+test_res_err_bad_only := assert match error.try(
+  (x) ~> rt.resources("photos", photos_h, { only: ["nope"] })) {
+  err(e): true, _: false }
+
+test_res_err_sing_index := assert match error.try(
+  (x) ~> rt.resource("profile", { index: get_h })) {
+  err(e): true, _: false }

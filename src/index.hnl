@@ -284,198 +284,30 @@ METHODS := ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
 CONFIG_KEYS := ["path", "pattern", "method", "methods", "constraints"]
 
-is_method_key := (k) ~> is_str(k) && mem(str.upper(k), METHODS)
-
-is_config_key := (k) ~> mem(k, CONFIG_KEYS)
-
---- key segments that contribute to a derived path/name ("." and ""
---- are index markers, not segments).
-clean_segs := (segs) ~> lfilter((s) ~> s != "." && s != "", segs)
-
-derived_path := (segs) ~> do {
-  cs := clean_segs(segs)
-  if alen(cs) == 0 { "/" } else { "/" + str.join(cs, "/") }
-}
-
-derived_name := (segs) ~> do {
-  cs := clean_segs(segs)
-  if alen(cs) == 0 { "index" } else { str.join(cs, "/") }
-}
-
 --- explicit `path`/`pattern` wins; a missing leading "/" is added.
 norm_path := (p) ~> if str.starts_with(p, "/") { p } else { "/" + p }
 
-explicit_path := (v, fallback) ~> do {
-  pp := hash_map.get_or(v, "path", hash_map.get_or(v, "pattern", null))
-  if pp == null {
-    fallback
-  } else {
-    if is_str(pp) {
-      norm_path(pp)
-    } else {
-      error.raise("http-router: route 'path'/'pattern' must be a string")
-    }
-  }
-}
+-- ---------------------------------------------------------------------
+-- route-map flattening -- delegated to lib-route's generic `route_map`
+-- (T-143 / P-008 phase 2). The opts reproduce this module's v2 semantics:
+-- HTTP method names as method-map keys, the config keys as allowed
+-- spec fields, the `handler`-family leaf keys (incl. the `name`/`doc`
+-- annotation passthrough), and "/" segment joining with the derived
+-- `name` = key path ("index" at the root).
+-- ---------------------------------------------------------------------
 
---- normalize `method`/`methods` (string or list of strings) to a
---- list of uppercased method names; absent -> ["*"].
-methods_of := (v) ~> do {
-  norm := (mv) ~> if is_str(mv) {
-    [str.upper(mv)]
-  } else {
-    if is_arr(mv) {
-      lmap((m) ~> if is_str(m) {
-        str.upper(m)
-      } else {
-        error.raise("http-router: method names must be strings")
-      }, mv)
-    } else {
-      error.raise("http-router: 'method'/'methods' must be a string or list")
-    }
-  }
-  if hash_map.has(v, "methods") {
-    norm(hash_map.get_or(v, "methods", []))
-  } else {
-    if hash_map.has(v, "method") {
-      norm(hash_map.get_or(v, "method", "*"))
-    } else {
-      ["*"]
-    }
-  }
-}
-
---- normalize a `constraints` spec (record `{k: v}` or list of
---- `{k,v}`/`{key,value}`/`[k,v]` pairs) to a list of `{k, v}` pairs;
---- null when absent.
-norm_cons := (v) ~> if v == null {
-  null
-} else {
-  if is_obj(v) {
-    lmap((k) ~> { k: k, v: hash_map.get_or(v, k, null) },
-      hash_map.keys(v))
-  } else {
-    if is_arr(v) {
-      lmap((p) ~> if is_obj(p) {
-        { k: hash_map.get_or(p, "k",
-            hash_map.get_or(p, "key", null)),
-          v: hash_map.get_or(p, "v",
-            hash_map.get_or(p, "value", null)) }
-      } else {
-        if is_arr(p) && alen(p) == 2 {
-          { k: p[0], v: p[1] }
-        } else {
-          error.raise("http-router: 'constraints' entries must be " +
-            "{k,v} pairs")
-        }
-      }, v)
-    } else {
-      error.raise("http-router: 'constraints' must be a record or " +
-        "list of pairs")
-    }
-  }
-}
-
---- true when `v` is a pure method map: at least one HTTP-method key
---- and no keys other than method names or leaf config keys.
-is_method_map := (v) ~> do {
-  ks := hash_map.keys(v)
-  mks := lfilter((k) ~> is_method_key(k), ks)
-  bad := lfilter((k) ~> is_method_key(k) == false && is_config_key(k) == false, ks)
-  alen(mks) > 0 && alen(bad) == 0
-}
-
---- leaf spec `{ method?, methods?, path?, pattern?, handler }` -> one
---- entry per method.
-spec_entries := (v, segs) ~> do {
-  h := hash_map.get_or(v, "handler", null)
-  chk := if is_arrow(h) { true } else {
-    error.raise("http-router: route 'handler' must be an arrow")
-  }
-  path := explicit_path(v, derived_path(segs))
-  nm := derived_name(segs)
-  cons := norm_cons(hash_map.get_or(v, "constraints", null))
-  lmap((m) ~> do {
-    e := { name: nm, method: m, path: path, handler: h }
-    if cons == null { e } else { hash_map.set(e, "constraints", cons) }
-  }, methods_of(v))
-}
-
---- method map `{ get: h, post: h, ... }` -> one entry per method key.
-mmap_entries := (v, segs) ~> do {
-  path := explicit_path(v, derived_path(segs))
-  nm := derived_name(segs)
-  cons := norm_cons(hash_map.get_or(v, "constraints", null))
-  while { xs: hash_map.keys(v), out: [] } {
-    (xs, out) ~> match xs {
-      []: { out: out },
-      [k, ...t]: if is_method_key(k) {
-        do {
-          h := hash_map.get_or(v, k, null)
-          if is_arrow(h) == false {
-            error.raise("http-router: method '" + k +
-              "' leaf must be an arrow")
-          } else {
-            do {
-              e := { name: nm, method: str.upper(k), path: path,
-                handler: h }
-              e2 := if cons == null { e } else {
-                hash_map.set(e, "constraints", cons)
-              }
-              { state: { xs: t, out: [...out, e2] } }
-            }
-          }
-        }
-      } else {
-        { state: { xs: t, out: out } }
-      }
-    }
-  }
-}
-
---- recursive route-map walker; `self` is passed explicitly because
---- self-recursive `:=` closures are not supported by the engines.
---- `v` is a leaf or nested map; `segs` is the accumulated key path.
-walk := (self, v, segs) ~> do {
-  if is_arrow(v) {
-    [{ name: derived_name(segs), method: "*",
-       path: derived_path(segs), handler: v }]
-  } else {
-    if is_obj(v) == false {
-      error.raise("http-router: route leaf must be an arrow or record (got " +
-        type.of(v) + ")")
-    } else {
-      if hash_map.has(v, "handler") {
-        spec_entries(v, segs)
-      } else {
-        if is_method_map(v) {
-          mmap_entries(v, segs)
-        } else {
-          while { xs: hash_map.keys(v), out: [] } {
-            (xs, out) ~> match xs {
-              []: { out: out },
-              [k, ...t]: do {
-                sub := hash_map.get_or(v, k, null)
-                nsegs := if k == "." || k == "" {
-                  segs
-                } else {
-                  [...segs, k]
-                }
-                ents := self(self, sub, nsegs)
-                { state: { xs: t, out: cat(out, ents) } }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+ROUTE_MAP_OPTS := {
+  sep: "/",
+  leaf_keys: ["handler", "path", "method", "methods", "constraints",
+    "name", "doc"],
+  spec_keys: CONFIG_KEYS,
+  methods: METHODS
 }
 
 --- flatten a route map into `{ entries, by_name }`; `by_name` keeps the
 --- first entry per name.
 build := (m) ~> do {
-  ents := walk(walk, m, [])
+  ents := rt.route_map(m, ROUTE_MAP_OPTS)
   by := while { xs: ents, acc: {} } {
     (xs, acc) ~> match xs {
       []: { out: acc },
@@ -500,7 +332,7 @@ entries_of := (routes) ~> do {
        is_arr(hash_map.get_or(routes, "entries", null)) {
       hash_map.get_or(routes, "entries", [])
     } else {
-      build(routes).entries
+      rt.route_map(routes, ROUTE_MAP_OPTS)
     }
   }
 }
@@ -517,7 +349,7 @@ method_ok := (r, m) ~> do {
 }
 
 --- the `{k, v}` search constraints a candidate carries: leaf-level
---- `entry.constraints` (normalized by `norm_cons`) plus whatever
+--- `entry.constraints` (normalized by `route_map`) plus whatever
 --- lib-route merged in from the pattern's `?k=v` suffix (looked up on
 --- both the candidate and its entry so either merge site works).
 cons_of := (cand) ~> cat(

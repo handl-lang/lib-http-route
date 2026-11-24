@@ -1272,3 +1272,31 @@ test_v3_disp_con_405 := assert cons_dispatch(
 test_v3_disp_con_404_not_405 := assert cons_dispatch(
   mkreqq("POST", "/items", "foo=no")) =
   { status: 404, body: "not found" }
+
+-- ---------------------------------------------------------------------
+-- T-143: doc/name annotation passthrough (route_map delegation)
+-- ---------------------------------------------------------------------
+
+doc_map := rt.route({
+  s: { handler: get_h, doc: { summary: "x" }, name: "op" }
+})
+
+test_doc_name_on_entry := assert match doc_map.entries {
+  [e, ..._t]: e.doc = { summary: "x" } && e.name == "op" &&
+    e.path == "/s" && e.method == "*" && e.handler != null,
+  _: false }
+
+test_doc_name_by_name := assert doc_map.by_name.op.path == "/s"
+
+test_doc_name_dispatch := assert rt.router(doc_map)(mkreq("GET", "/s")) =
+  { status: 200, body: "GET" }
+
+test_doc_name_mmap := assert match rt.route({
+  m: { methods: ["get", "post"], path: "/mm",
+       constraints: { t: "1" }, doc: { summary: "m" },
+       handler: get_h } }).entries {
+  [e1, e2]: e1.doc = { summary: "m" } && e2.doc = { summary: "m" } &&
+    e1.method == "GET" && e2.method == "POST" &&
+    e1.constraints = [{ k: "t", v: "1" }],
+  _: false
+}

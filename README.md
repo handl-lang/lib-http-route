@@ -122,7 +122,7 @@ src/index.hnl        the router (pure handl; deps: route (lib-route),
 src/index.test.hnl   89 tests: match_path, query, route/router,
                      route maps, href, form, specificity, 405, json_body
 pkg.hnl              package manifest — modules, deps, license
-ci.sh                bupha entry → scripts/hnl-gate.sh
+workflows/gate.yaml                bupha entry (handl-gates) → scripts/hnl-gate.sh
 ```
 
 ## Gate
